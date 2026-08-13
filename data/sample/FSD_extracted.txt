@@ -1,0 +1,886 @@
+FUNCTIONAL SPECIFICATION DOCUMENT
+AI-Orchestrated Multi-Source Data Integration Pipeline
+Internal Engineering Document
+
+Field
+Value
+Field
+Value
+Document Title
+Data Integration Pipeline FSD
+Version
+0.2 (Draft)
+Owner
+Data Science / Platform Team
+Status
+Draft — For Internal Review
+Classification
+Internal Use Only
+Prepared For
+Engineering Leadership
+
+Revision History
+Version
+Date
+Author
+Summary of Changes
+0.1
+Draft
+Data Science Team
+Initial draft for internal review and scoping discussion
+0.2
+Draft
+Data Science Team
+Tailored Section 7 worked example and Appendix A IR snippet to a companion practice pipeline (products/customers/transactions → customer_lifetime_value) modeled on Palantir Foundry’s public “Building Your First Pipeline” tutorial; updated Section 1.4 references, Section 10.1 assumptions, and Appendix B open questions accordingly.
+
+Table of Contents
+
+
+
+1. Introduction
+1.1 Purpose
+This Functional Specification Document (FSD) defines the functional and non-functional requirements for a data integration pipeline that ingests data from heterogeneous sources and formats, normalizes it into a common representation, and applies AI-agent-assisted transformation, mapping, and join logic to produce a unified, discrepancy-free output. The document is intended to translate the architectural concepts already agreed in internal discussion into a build-ready specification for engineering, QA, and platform teams.
+1.2 Scope
+This specification covers the design of a batch-and-streaming-capable data integration engine composed of the components listed in Section 3. It is scoped as follows:
+In Scope
+Out of Scope (this phase)
+Ingestion from structured (CSV, RDBMS), semi-structured (API/JSON), and streaming sources
+Building a proprietary distributed execution engine (Spark/Flink will be used, not built)
+Canonical schema/type registry and format normalization
+Full ontology/knowledge-graph product surface (only the integration hooks are in scope)
+AI agent for source identification, field mapping inference, join inference, and transform generation
+Multi-tenant SaaS deployment; this phase targets single-tenant internal deployment
+Confidence scoring and human-in-the-loop review for agent-generated logic
+Natural-language BI/reporting layer on top of the output data
+Type checking, schema/contract validation, provenance and lineage tracking
+Automated data-quality remediation (auto-fix); this phase flags, does not auto-correct
+Versioning, proposal/diff review, and controlled deployment of pipeline logic
+Real-time collaborative multi-user editing of the same pipeline graph
+
+1.3 Intended Audience
+Data Engineering and Platform Engineering teams responsible for implementation
+Data Science / AI team responsible for the agent orchestrator and inference models
+QA / Test Engineering for acceptance test derivation
+Engineering leadership and project sponsors for scope sign-off
+1.4 References
+Internal discussion notes: "Data Integration Pipeline — Architecture Discussion" (this working session)
+Publicly available product documentation reviewed for architectural pattern reference (data pipeline builder UI/UX conventions)
+Companion practice pipeline reference: transcript of Palantir Foundry’s public tutorial “Build with Us | Deep Dive: Building Your First Pipeline,” used as the concrete worked example in Section 7 and Appendix A.
+2. Definitions, Acronyms & Abbreviations
+Term
+Definition
+DAG
+Directed Acyclic Graph — the pipeline execution graph with no circular dependencies
+IR
+Intermediate Representation — the engine-agnostic logical plan (Filter, Join, Cast, Map, etc.) compiled from the visual/graph pipeline
+Ontology
+A semantic layer mapping normalized data to business objects (e.g., Supplier, Transaction) and their relationships
+Common Model
+The canonical, format-agnostic schema all sources are normalized into before transformation
+Agent
+The AI orchestration component that infers sources, mappings, joins, and generates transform logic
+Confidence Score
+A numeric estimate (0–1) of the agent's certainty in a given inferred mapping or join
+HITL
+Human-In-The-Loop — a mandatory human review/approval checkpoint before low-confidence logic executes
+Provenance
+Metadata recording the origin and derivation path of every field/row in the output dataset
+Contract
+The required output schema (column set, types, nullability) an output dataset must satisfy
+FR
+Functional Requirement
+NFR
+Non-Functional Requirement
+
+3. System Overview
+3.1 Design Principles
+Engine-agnostic core: Pipeline logic is captured as an Intermediate Representation, decoupled from the execution engine, so batch (Spark) and streaming (Flink) share the same logical plan.
+Contract-driven output: Every output dataset is validated continuously against a required schema, not only at the end of a run.
+Agent proposes, human disposes: The AI agent generates candidate mappings, joins, and transforms; anything below a confidence threshold is routed to mandatory human review before execution.
+Full provenance: Every field and row in the output is traceable to its source and the exact rule/inference that produced it.
+Change safety: Pipeline modifications are proposed, diffed against the current live version, and explicitly deployed — never silently overwritten.
+3.2 High-Level Architecture
+The diagram below shows the end-to-end component flow, from raw source ingestion through AI-assisted integration to the validated, ontology-mapped output.
+
+Figure 1: End-to-end pipeline architecture
+3.3 Component Summary
+Component
+Responsibility
+Ingestion Layer
+Pluggable connectors that pull raw data from batch and streaming sources in native format
+Schema & Type Registry
+Canonical type system (e.g., Timestamp, GeometryCol, PhoneNumber) all sources map onto
+Normalization / Mapping Engine
+Per-source transform chains that cast raw fields into the canonical schema
+Union / Merge Stage
+Combines normalized sources into a single dataset once schemas are aligned
+AI Agent Orchestrator
+Identifies sources, infers field mappings and joins, and generates transform logic with confidence scores
+Intermediate Representation (IR)
+Engine-agnostic logical plan (Filter, Join, Cast, Map, Aggregate) compiled from the pipeline graph
+Type Checker
+Statically validates that IR operations are type-safe before execution
+Contract / Schema Validator
+Confirms the projected output satisfies the required output schema
+Preview & HITL Gate
+Renders a sample of pipeline output and blocks execution on low-confidence agent decisions until reviewed
+Execution Engine
+Compiles and runs the IR on SQL, Spark, or Flink depending on volume/latency needs
+Provenance & Lineage Tracker
+Captures the origin and derivation path of every field and row
+Common Model / Ontology Layer
+Maps normalized datasets to semantic business objects and relationships
+Versioning / Proposal & Diff System
+Branches, diffs, and reviews pipeline logic changes prior to deployment
+Deployment Module
+Publishes reviewed pipeline changes and (re)builds target outputs
+Monitoring & Alerting
+Tracks run health, data-quality metrics, and SLA breaches
+Security & Access Control
+Enforces authentication, authorization, and data-access policy across the pipeline
+
+4. Functional Requirements
+Requirements are grouped by component and numbered for traceability into test cases. Priority follows MoSCoW: M = Must have, S = Should have, C = Could have.
+4.1 Ingestion Layer
+Responsible for connecting to and pulling data from all configured sources, in batch or streaming mode, without transforming content.
+ID
+Requirement
+Description
+Priority
+FR-ING-01
+Multi-format connectors
+System shall support ingestion from CSV/flat files, relational databases (via JDBC/ODBC), REST/JSON APIs, and streaming topics (e.g., Kafka).
+M
+FR-ING-02
+Schema-on-read detection
+System shall auto-detect the raw schema (column names, inferred types) of an incoming source on first connection.
+M
+FR-ING-03
+Incremental/CDC ingestion
+System shall support incremental pulls (timestamp/offset-based) in addition to full loads, to avoid reprocessing unchanged data.
+S
+FR-ING-04
+Connection credential management
+Source credentials shall be stored in a secrets manager and never persisted in pipeline definitions.
+M
+FR-ING-05
+Ingestion failure isolation
+A failure in one source connector shall not block ingestion from other independent sources in the same run.
+M
+
+4.2 Schema & Type Registry
+Defines and stores the canonical set of data types and business fields used as the common vocabulary across all sources.
+ID
+Requirement
+Description
+Priority
+FR-REG-01
+Canonical type catalog
+System shall maintain a registry of canonical types (String, Timestamp, GeometryCol, PhoneNumber, Enum, Array<T>, etc.).
+M
+FR-REG-02
+Type-scoped operation catalog
+Each canonical type shall expose only the transform operations valid for that type (e.g., date-diff for Timestamp, area-code extraction for PhoneNumber).
+S
+FR-REG-03
+Registry versioning
+Changes to the canonical schema shall be versioned; existing pipelines shall not silently break on registry updates.
+M
+FR-REG-04
+Custom type extension
+Authorized users shall be able to register new canonical types with associated validation rules.
+C
+
+4.3 Normalization / Mapping Engine
+Casts and reshapes each source's raw fields into the canonical schema defined by the registry.
+ID
+Requirement
+Description
+Priority
+FR-NORM-01
+Per-source mapping definition
+System shall allow an explicit, editable mapping of raw source fields to canonical fields, per source.
+M
+FR-NORM-02
+Composable transform chains
+A mapping path shall support chaining multiple discrete operations (clean, cast, concatenate, derive) with independent preview at each step.
+M
+FR-NORM-03
+Null/format handling rules
+System shall allow configurable handling for nulls, empty strings, and whitespace per field during normalization.
+M
+FR-NORM-04
+Preview at each step
+Users shall be able to preview sample output after any individual transform step without running the full pipeline.
+S
+
+4.4 Union / Merge Stage
+Combines multiple normalized sources sharing the canonical schema into one unified dataset.
+ID
+Requirement
+Description
+Priority
+FR-UNION-01
+Schema-matched union
+System shall union only sources whose canonical schemas match; mismatches shall raise a pre-execution error, not a silent drop.
+M
+FR-UNION-02
+Source tagging
+Each unioned row shall retain a hidden source-identifier column for downstream provenance and debugging.
+M
+FR-UNION-03
+Duplicate detection
+System shall flag exact-duplicate rows across unioned sources for review, not silently deduplicate.
+S
+
+4.5 AI Agent Orchestrator
+The AI component that reduces manual configuration by proposing sources, mappings, joins, and transforms; detailed further in Section 5.
+ID
+Requirement
+Description
+Priority
+FR-AGENT-01
+Source identification
+Given a natural-language request, the agent shall identify and propose candidate source systems/datasets relevant to the request.
+M
+FR-AGENT-02
+Mapping inference
+Agent shall propose field-to-canonical-field mappings based on name similarity, type compatibility, and sample-value profiling.
+M
+FR-AGENT-03
+Join key inference
+Agent shall propose join keys and join type (inner/left/full) between datasets, with a confidence score per proposal.
+M
+FR-AGENT-04
+Transform generation
+Agent shall generate IR-level transform steps (filter, cast, derive) implementing the user's stated intent.
+M
+FR-AGENT-05
+Confidence scoring
+Every agent-generated mapping, join, or transform shall carry a numeric confidence score (0–1).
+M
+FR-AGENT-06
+Explanation output
+Agent shall provide a human-readable rationale for each proposed mapping/join (e.g., matched field names, value overlap %).
+S
+FR-AGENT-07
+Iterative refinement
+Users shall be able to correct an agent proposal in natural language or directly in the graph, and the agent shall incorporate the correction into subsequent suggestions in the same session.
+S
+
+4.6 Intermediate Representation (IR)
+The engine-agnostic logical plan that the visual pipeline graph compiles into.
+ID
+Requirement
+Description
+Priority
+FR-IR-01
+Canonical operator set
+IR shall express pipeline logic using a fixed, documented operator set: Filter, Join, Cast, Map, Aggregate, Window, Union.
+M
+FR-IR-02
+Engine compilation targets
+IR shall be compilable to at least two execution backends (e.g., Spark for batch, Flink for streaming) without change to the IR itself.
+M
+FR-IR-03
+Human-readable export
+Users shall be able to export the generated IR/code (e.g., PySpark) for manual inspection or editing ("code escape hatch").
+S
+FR-IR-04
+Round-trip editing
+Manual edits made in the code escape hatch shall, where syntactically supported, be re-parsed back into the visual graph.
+C
+
+4.7 Type Checker
+Performs static validation of the IR prior to execution.
+ID
+Requirement
+Description
+Priority
+FR-TC-01
+Pre-execution type validation
+System shall reject IR plans containing type-incompatible operations (e.g., date-diff on a String column) before execution.
+M
+FR-TC-02
+Join key type compatibility check
+System shall verify join keys are of compatible/comparable types and warn (not silently proceed) when coercion is required.
+M
+FR-TC-03
+Inline error reporting
+Type errors shall be surfaced at the specific node in the graph that caused them, not only as a run-level failure.
+M
+
+4.8 Contract / Schema Validator
+Ensures the pipeline output continues to satisfy its declared required schema.
+ID
+Requirement
+Description
+Priority
+FR-VAL-01
+Required-column tracking
+System shall display, at all times during editing, how many of the output contract's required columns are currently satisfied (e.g., "37/39").
+M
+FR-VAL-02
+Nullability & constraint checks
+Validator shall check declared nullability, uniqueness, and range constraints against a sample/full run before deployment.
+S
+FR-VAL-03
+Breaking-change warning
+System shall warn explicitly when a change would drop a currently-required output column ("1 column will be dropped").
+M
+
+4.9 Preview & Human-in-the-Loop (HITL) Gate
+The mandatory checkpoint between agent-generated logic and execution.
+ID
+Requirement
+Description
+Priority
+FR-PREV-01
+Sample preview
+System shall render a representative data sample reflecting the current pipeline state at any node, on demand.
+M
+FR-PREV-02
+Confidence-threshold gating
+Any agent-proposed mapping, join, or transform below a configurable confidence threshold shall require explicit human approval before it can be deployed.
+M
+FR-PREV-03
+Bulk review UI
+Reviewers shall be able to view all low-confidence proposals for a pipeline in a single consolidated list with approve/reject/edit actions.
+S
+FR-PREV-04
+Audit trail of approvals
+Every HITL approval/rejection shall be logged with reviewer identity, timestamp, and the reviewed proposal.
+M
+
+4.10 Execution Engine
+Runs the validated IR against the appropriate compute backend.
+ID
+Requirement
+Description
+Priority
+FR-EXE-01
+Batch execution
+System shall execute batch pipelines via a distributed engine (Spark) for large-volume datasets.
+M
+FR-EXE-02
+Streaming execution
+System shall execute streaming pipelines via a stream-processing engine (Flink or equivalent) for continuous sources.
+S
+FR-EXE-03
+Lightweight/SQL execution
+System shall route small or ad-hoc pipelines to a direct SQL engine to avoid distributed-compute overhead.
+C
+FR-EXE-04
+Partial-failure handling
+A failed run shall report the exact failing node/operation, not just a generic run failure.
+M
+
+4.11 Provenance & Lineage Tracking
+Captures the origin and derivation of every field and row in the output.
+ID
+Requirement
+Description
+Priority
+FR-PROV-01
+Field-level lineage
+System shall record, for every output field, the source field(s) and transform chain that produced it.
+M
+FR-PROV-02
+Row-level join provenance
+For joined rows, system shall record which join rule (and, if AI-inferred, which agent decision and confidence score) produced the match.
+M
+FR-PROV-03
+Lineage query interface
+Users shall be able to query "why did this output row/value exist" and get a traceable answer without re-running the pipeline.
+S
+
+4.12 Common Model / Ontology Layer
+Maps the validated, unified dataset onto semantic business objects and relationships.
+ID
+Requirement
+Description
+Priority
+FR-ONT-01
+Object type mapping
+System shall allow mapping a dataset's rows to a defined business object type (e.g., Supplier, Transaction).
+S
+FR-ONT-02
+Relationship/link definition
+System shall support defining relationships between object types derived from join keys used in the pipeline.
+S
+FR-ONT-03
+Backward propagation
+Changes to the ontology mapping shall not silently alter the underlying output dataset without a corresponding pipeline change.
+M
+
+4.13 Versioning / Proposal & Diff System
+Provides safe, reviewable evolution of pipeline logic.
+ID
+Requirement
+Description
+Priority
+FR-VER-01
+Branch-based editing
+Users shall be able to edit a pipeline on an isolated branch without affecting the live ("Main") version.
+M
+FR-VER-02
+Change diffing
+System shall show an explicit diff (added/modified/removed transforms and outputs) between a branch and Main before merge.
+M
+FR-VER-03
+Propose/review/merge workflow
+Merging a branch into Main shall require an explicit proposal and, per configured policy, a second-party review.
+M
+FR-VER-04
+Rollback
+System shall allow reverting Main to any previously deployed version.
+S
+
+4.14 Deployment Module
+Publishes approved pipeline logic and materializes target outputs.
+ID
+Requirement
+Description
+Priority
+FR-DEPLOY-01
+Explicit deploy action
+Deploying pipeline logic to production shall be a distinct, explicit action separate from saving edits.
+M
+FR-DEPLOY-02
+Scheduled & triggered builds
+System shall support both scheduled (cron-like) and event-triggered pipeline builds.
+M
+FR-DEPLOY-03
+Deployment pre-checks
+System shall block deployment if type-checking or contract validation currently fails.
+M
+
+4.15 Monitoring & Alerting
+Provides visibility into pipeline health and data quality over time.
+ID
+Requirement
+Description
+Priority
+FR-MON-01
+Run health dashboard
+System shall expose run status, duration, and row-count trends per pipeline.
+S
+FR-MON-02
+Data-quality metrics
+System shall track null-rate, schema-drift, and duplicate-rate metrics per output over time.
+S
+FR-MON-03
+SLA/failure alerting
+System shall notify designated owners on run failure or SLA breach via configured channels.
+M
+
+4.16 Security & Access Control
+Governs who can view, edit, approve, and deploy pipeline logic and data.
+ID
+Requirement
+Description
+Priority
+FR-SEC-01
+Role-based access control
+System shall enforce role-based permissions (view/edit/approve/deploy) at the pipeline level.
+M
+FR-SEC-02
+Column-level security
+System shall support restricting visibility of sensitive columns (e.g., tax IDs) by role.
+S
+FR-SEC-03
+Full audit logging
+All edits, approvals, and deployments shall be logged with actor, timestamp, and change detail.
+M
+
+
+5. AI Agent Orchestrator — Detailed Behavior
+The agent is the highest-risk and most novel component in this system, since it makes semantic judgments (e.g., "this field means the same thing as that field") rather than purely syntactic ones. This section defines its operating stages and the mandatory confidence-scoring/HITL policy referenced throughout Section 4.
+5.1 Processing Stages
+Stage
+Name
+Behavior
+1
+Source Identification
+Parse the user's natural-language request; match intent against catalogued datasets/systems using metadata and prior usage; return ranked candidate sources.
+2
+Mapping Inference
+For each candidate source, propose field-to-canonical mappings using name similarity, type compatibility, and value-distribution profiling.
+3
+Join Inference
+Propose join keys and join type across selected sources using key-cardinality analysis, referential patterns, and value-overlap sampling.
+4
+Transform Generation
+Generate IR-level operations that satisfy the user's stated intent (filters, derivations, aggregations).
+5
+Confidence Scoring
+Attach a 0–1 confidence score to every mapping, join, and transform, computed from the evidence used in stages 2–4.
+6
+Routing
+Proposals at or above the confidence threshold flow directly to Preview; proposals below threshold are flagged and require HITL approval before Preview/execution.
+
+5.2 Confidence & Risk Policy
+Risk is not uniform across agent decisions. The policy below reflects that field-mapping errors are usually caught by type checking, while join errors are semantic and can pass type checking while still being wrong.
+Agent Decision
+Risk Level
+Rationale
+Policy
+Source identification
+Low
+Wrong dataset is usually obvious in preview
+Auto-proceed; shown in UI for confirmation
+Mapping inference
+Medium
+Type checker catches most hard failures; semantic mismatches can slip through
+Auto-proceed above 0.85 confidence; else HITL
+Join inference
+High
+Two well-typed columns can be joinable and still semantically wrong
+HITL required below 0.95 confidence; always shown in Preview regardless of score
+Transform generation
+Medium
+Logic errors are checkable via preview/dry-run diffing
+Auto-proceed above 0.85 confidence; else HITL
+
+5.3 Non-Negotiable Guardrails
+The agent shall never execute a write to a production output without passing through Type Checker, Contract Validator, and (where applicable) HITL approval.
+Every agent decision shall be persisted with its confidence score and evidence, independent of whether it required human review, to support later audit.
+A rejected agent proposal shall not be silently retried with the same evidence; it shall require either new evidence or explicit human override.
+
+6. Non-Functional Requirements
+Category
+Requirement
+Performance
+Batch pipelines on datasets up to [X] million rows shall complete within [Y] minutes; specific targets to be confirmed with infra team based on expected data volumes.
+Scalability
+Ingestion and execution layers shall scale horizontally with data volume without pipeline redefinition.
+Reliability
+Failed runs shall be automatically retried according to a configurable policy (e.g., 3 retries with backoff) before alerting.
+Availability
+The pipeline authoring UI and metadata services shall target 99.5% uptime during business hours.
+Auditability
+All schema, mapping, join, and deployment decisions must be reconstructable from logs for at least [retention period, e.g., 1 year].
+Security
+Data in transit and at rest shall be encrypted; access shall be governed by the RBAC model in FR-SEC-01.
+Maintainability
+New source connectors and canonical types shall be addable via configuration/plugin, not core-code changes.
+Usability
+A non-technical business user shall be able to request a basic integration in natural language and reach a reviewable preview without writing code.
+Portability
+The IR shall not be tied to a single execution engine, preserving the option to add/replace backends.
+
+7. End-to-End Data Flow — Worked Example
+Illustrative walkthrough for our companion practice pipeline (modeled on Palantir Foundry’s public "Building Your First Pipeline" tutorial), for the representative request: "Clean and join products, customers, and transactions into a customer lifetime value dataset."
+Step
+Action
+1
+User submits the request: “Clean and join products, customers, and transactions into a customer lifetime value dataset.”
+2
+Agent (Source ID stage) identifies products.csv, customers.json, and transactions.json as candidate sources and confirms with the user.
+3
+Ingestion Layer connects to all three sources and pulls raw data in native format (CSV, nested JSON, JSON).
+4
+Agent (Mapping Inference) proposes field mappings to the canonical Product, Customer, and Transaction schemas — including flattening the Customer address struct into flat street/city/state fields; mappings above 0.85 confidence auto-apply, others queue for review.
+5
+Normalization Engine applies the approved mappings: trims whitespace on product_name, casts price and units from string to numeric, parses the transaction_date string into a timestamp, and drops residual ingestion artifact columns.
+6
+Agent (Join Inference) proposes joining transactions to products on product_id, with a confidence score; because join risk is High, this always routes to the HITL Preview regardless of score.
+7
+Reviewer inspects the Preview and notices row-count skew (172 joined rows vs. 50 source rows) — exactly the kind of semantic error type checking cannot catch on its own, since product_id and price are both well-typed but product_id is not actually unique.
+8
+Reviewer rejects the proposed join key and directs the agent to rejoin on product_variation_id instead, which uniqueness checking confirms is a true primary key.
+9
+Type Checker and Contract Validator confirm the corrected IR is type-safe and satisfies the required output schema for “customer_lifetime_value.”
+10
+Execution Engine (Spark, given batch volume) runs the validated IR: joins transactions → products → customers, then aggregates (group by customer_id, sum revenue = price × units).
+11
+Output dataset is produced with full field- and row-level provenance recorded, including which join key was used and that it was corrected via HITL review.
+12
+Output is optionally mapped to the Customer object type in the Common Model/Ontology layer.
+13
+Change is proposed, diffed against the current Main pipeline, reviewed, and explicitly deployed.
+
+8. User Roles & Permissions
+Role
+View
+Edit Pipeline
+Approve (HITL)
+Deploy
+Business User
+Yes
+Request only (via agent)
+No
+No
+Analytical User
+Yes
+Yes (own branches)
+No
+No
+Data Engineer
+Yes
+Yes
+Yes
+Yes (with review)
+Pipeline Manager / Approver
+Yes
+Yes
+Yes
+Yes
+Admin
+Yes
+Yes
+Yes
+Yes
+
+9. Error Handling & Exception Management
+Failure Scenario
+System Behavior
+Notification
+Source connection failure
+Isolate failing source; continue ingesting from remaining sources; mark run partially complete
+Alert source owner + pipeline owner
+Schema mismatch at Union
+Block merge; surface exact column(s)/type(s) in conflict at the offending node
+Inline UI error; no silent drop
+Type-check failure
+Block deployment/execution; highlight failing operation in graph
+Inline UI error
+Contract validation failure (missing required column)
+Block deployment; show required-vs-actual column diff
+Inline UI warning (e.g., "37/39 required columns")
+Low-confidence agent proposal
+Route to HITL queue; do not auto-execute
+Notify assigned reviewer
+Execution/runtime failure
+Halt run; report failing node and error detail; retry per policy
+Alert pipeline owner and on-call
+Post-deployment data-quality drift
+Flag metric breach; do not auto-roll-back by default (configurable)
+Alert pipeline owner
+
+10. Assumptions, Dependencies & Constraints
+10.1 Assumptions
+Source systems expose stable, queryable interfaces (DB access, API, or file drop) — no reverse-engineering of undocumented formats.
+An initial canonical schema for at least one business domain will be defined collaboratively before agent training/tuning begins — piloted via the Customer domain in the companion products/customers/transactions practice pipeline (Section 7).
+Sufficient labeled or historical mapping/join examples exist, or will be created, to tune the agent's inference confidence scoring.
+10.2 Dependencies
+Distributed execution engine (Spark) and, if streaming is prioritized, a stream processor (Flink/Kafka Streams).
+Secrets management service for source credentials.
+Identity/RBAC provider for role-based access control.
+10.3 Constraints
+Phase 1 targets single-tenant, internal deployment only (see Section 1.2).
+Real-time multi-user co-editing of the same pipeline branch is out of scope; branch-based isolation is the concurrency model.
+Auto-remediation of data-quality issues is out of scope; the system flags issues for human resolution.
+
+11. Acceptance Criteria (Phase 1)
+#
+Criterion
+Ref
+1
+Pipeline can ingest from at least one file-based, one database, and one API source in a single run
+FR-ING
+2
+Agent proposes source identification, mapping, and join candidates for a natural-language request with a confidence score attached to each
+FR-AGENT
+3
+Any join proposal is held for human review before execution, regardless of confidence score
+5.2
+4
+Output dataset is blocked from deployment if required contract columns are missing
+FR-VAL
+5
+Every output row's provenance (source + transform chain + join rule) can be queried after a run
+FR-PROV
+6
+A pipeline change can be branched, diffed against Main, and deployed only after explicit approval
+FR-VER
+7
+A failed source connector does not prevent ingestion from unrelated, healthy sources in the same run
+FR-ING-05
+
+Appendix A: Illustrative IR Snippet
+The following shows how the corrected join from our companion practice pipeline (Section 7) would be represented in the Intermediate Representation described in Section 4.6 — including the rejected agent-proposed join and the human-corrected join that replaced it, both retained for provenance. This is conceptual, not a final schema, and is intended to ground engineering discussion.
+{  "pipeline": "customer_lifetime_value",  "steps": [    { "op": "Cast", "input": "products", "field": "price", "to": "Double" },    { "op": "Cast", "input": "transactions", "field": "units", "to": "Double" },    { "op": "Map", "input": "products", "field": "product_name", "transform": "TrimWhitespace" },    { "op": "Map", "input": "transactions", "field": "transaction_date", "transform": "ParseTimestamp" },    { "op": "Join",      "left": "transactions", "right": "products",      "on": [{ "left_key": "product_id", "right_key": "product_id" }],      "type": "left",      "confidence": 0.93,      "source": "agent_inferred",      "review_status": "rejected_by_hitl",      "rejection_reason": "product_id not unique in products (uniqueness check failed); row count skew 172 vs 50 expected" },    { "op": "Join",      "left": "transactions", "right": "products",      "on": [{ "left_key": "product_id", "right_key": "product_variation_id" }],      "type": "left",      "confidence": null,      "source": "human_override",      "review_status": "approved" },    { "op": "Join",      "left": "join_result", "right": "customers",      "on": [{ "left_key": "customer_id", "right_key": "customer_id" }],      "type": "left",      "confidence": 0.98,      "source": "agent_inferred",      "review_status": "approved" },    { "op": "Map", "input": "join_result", "field": "revenue", "expression": "price * units" },    { "op": "Aggregate", "input": "join_result", "group_by": ["customer_id", "name", "address"], "agg": [{ "field": "revenue", "fn": "sum", "as": "revenue" }] }  ],  "output_contract": "customer_lifetime_value_v1"}
+Appendix B: Open Questions for Next Working Session
+Confirm target data volumes/SLAs to finalize the performance NFRs in Section 6.
+Confirm whether Phase 1 requires streaming ingestion or can defer FR-EXE-02 to Phase 2.
+Confirm confidence-threshold values in Section 5.2 against a labeled validation set once available.
+Confirm retention period for audit/provenance logs (compliance requirement, if any).
+Answered — Customer domain, piloted via the products/customers/transactions → customer_lifetime_value companion practice pipeline (Section 7). Confirm whether additional domains (e.g., Supplier) should be piloted next.
+Field | Value | Field | Value
+Document Title | Data Integration Pipeline FSD | Version | 0.2 (Draft)
+Owner | Data Science / Platform Team | Status | Draft — For Internal Review
+Classification | Internal Use Only | Prepared For | Engineering Leadership
+Version | Date | Author | Summary of Changes
+0.1 | Draft | Data Science Team | Initial draft for internal review and scoping discussion
+0.2 | Draft | Data Science Team | Tailored Section 7 worked example and Appendix A IR snippet to a companion practice pipeline (products/customers/transactions → customer_lifetime_value) modeled on Palantir Foundry’s public “Building Your First Pipeline” tutorial; updated Section 1.4 references, Section 10.1 assumptions, and Appendix B open questions accordingly.
+In Scope | Out of Scope (this phase)
+Ingestion from structured (CSV, RDBMS), semi-structured (API/JSON), and streaming sources | Building a proprietary distributed execution engine (Spark/Flink will be used, not built)
+Canonical schema/type registry and format normalization | Full ontology/knowledge-graph product surface (only the integration hooks are in scope)
+AI agent for source identification, field mapping inference, join inference, and transform generation | Multi-tenant SaaS deployment; this phase targets single-tenant internal deployment
+Confidence scoring and human-in-the-loop review for agent-generated logic | Natural-language BI/reporting layer on top of the output data
+Type checking, schema/contract validation, provenance and lineage tracking | Automated data-quality remediation (auto-fix); this phase flags, does not auto-correct
+Versioning, proposal/diff review, and controlled deployment of pipeline logic | Real-time collaborative multi-user editing of the same pipeline graph
+Term | Definition
+DAG | Directed Acyclic Graph — the pipeline execution graph with no circular dependencies
+IR | Intermediate Representation — the engine-agnostic logical plan (Filter, Join, Cast, Map, etc.) compiled from the visual/graph pipeline
+Ontology | A semantic layer mapping normalized data to business objects (e.g., Supplier, Transaction) and their relationships
+Common Model | The canonical, format-agnostic schema all sources are normalized into before transformation
+Agent | The AI orchestration component that infers sources, mappings, joins, and generates transform logic
+Confidence Score | A numeric estimate (0–1) of the agent's certainty in a given inferred mapping or join
+HITL | Human-In-The-Loop — a mandatory human review/approval checkpoint before low-confidence logic executes
+Provenance | Metadata recording the origin and derivation path of every field/row in the output dataset
+Contract | The required output schema (column set, types, nullability) an output dataset must satisfy
+FR | Functional Requirement
+NFR | Non-Functional Requirement
+Component | Responsibility
+Ingestion Layer | Pluggable connectors that pull raw data from batch and streaming sources in native format
+Schema & Type Registry | Canonical type system (e.g., Timestamp, GeometryCol, PhoneNumber) all sources map onto
+Normalization / Mapping Engine | Per-source transform chains that cast raw fields into the canonical schema
+Union / Merge Stage | Combines normalized sources into a single dataset once schemas are aligned
+AI Agent Orchestrator | Identifies sources, infers field mappings and joins, and generates transform logic with confidence scores
+Intermediate Representation (IR) | Engine-agnostic logical plan (Filter, Join, Cast, Map, Aggregate) compiled from the pipeline graph
+Type Checker | Statically validates that IR operations are type-safe before execution
+Contract / Schema Validator | Confirms the projected output satisfies the required output schema
+Preview & HITL Gate | Renders a sample of pipeline output and blocks execution on low-confidence agent decisions until reviewed
+Execution Engine | Compiles and runs the IR on SQL, Spark, or Flink depending on volume/latency needs
+Provenance & Lineage Tracker | Captures the origin and derivation path of every field and row
+Common Model / Ontology Layer | Maps normalized datasets to semantic business objects and relationships
+Versioning / Proposal & Diff System | Branches, diffs, and reviews pipeline logic changes prior to deployment
+Deployment Module | Publishes reviewed pipeline changes and (re)builds target outputs
+Monitoring & Alerting | Tracks run health, data-quality metrics, and SLA breaches
+Security & Access Control | Enforces authentication, authorization, and data-access policy across the pipeline
+ID | Requirement | Description | Priority
+FR-ING-01 | Multi-format connectors | System shall support ingestion from CSV/flat files, relational databases (via JDBC/ODBC), REST/JSON APIs, and streaming topics (e.g., Kafka). | M
+FR-ING-02 | Schema-on-read detection | System shall auto-detect the raw schema (column names, inferred types) of an incoming source on first connection. | M
+FR-ING-03 | Incremental/CDC ingestion | System shall support incremental pulls (timestamp/offset-based) in addition to full loads, to avoid reprocessing unchanged data. | S
+FR-ING-04 | Connection credential management | Source credentials shall be stored in a secrets manager and never persisted in pipeline definitions. | M
+FR-ING-05 | Ingestion failure isolation | A failure in one source connector shall not block ingestion from other independent sources in the same run. | M
+ID | Requirement | Description | Priority
+FR-REG-01 | Canonical type catalog | System shall maintain a registry of canonical types (String, Timestamp, GeometryCol, PhoneNumber, Enum, Array<T>, etc.). | M
+FR-REG-02 | Type-scoped operation catalog | Each canonical type shall expose only the transform operations valid for that type (e.g., date-diff for Timestamp, area-code extraction for PhoneNumber). | S
+FR-REG-03 | Registry versioning | Changes to the canonical schema shall be versioned; existing pipelines shall not silently break on registry updates. | M
+FR-REG-04 | Custom type extension | Authorized users shall be able to register new canonical types with associated validation rules. | C
+ID | Requirement | Description | Priority
+FR-NORM-01 | Per-source mapping definition | System shall allow an explicit, editable mapping of raw source fields to canonical fields, per source. | M
+FR-NORM-02 | Composable transform chains | A mapping path shall support chaining multiple discrete operations (clean, cast, concatenate, derive) with independent preview at each step. | M
+FR-NORM-03 | Null/format handling rules | System shall allow configurable handling for nulls, empty strings, and whitespace per field during normalization. | M
+FR-NORM-04 | Preview at each step | Users shall be able to preview sample output after any individual transform step without running the full pipeline. | S
+ID | Requirement | Description | Priority
+FR-UNION-01 | Schema-matched union | System shall union only sources whose canonical schemas match; mismatches shall raise a pre-execution error, not a silent drop. | M
+FR-UNION-02 | Source tagging | Each unioned row shall retain a hidden source-identifier column for downstream provenance and debugging. | M
+FR-UNION-03 | Duplicate detection | System shall flag exact-duplicate rows across unioned sources for review, not silently deduplicate. | S
+ID | Requirement | Description | Priority
+FR-AGENT-01 | Source identification | Given a natural-language request, the agent shall identify and propose candidate source systems/datasets relevant to the request. | M
+FR-AGENT-02 | Mapping inference | Agent shall propose field-to-canonical-field mappings based on name similarity, type compatibility, and sample-value profiling. | M
+FR-AGENT-03 | Join key inference | Agent shall propose join keys and join type (inner/left/full) between datasets, with a confidence score per proposal. | M
+FR-AGENT-04 | Transform generation | Agent shall generate IR-level transform steps (filter, cast, derive) implementing the user's stated intent. | M
+FR-AGENT-05 | Confidence scoring | Every agent-generated mapping, join, or transform shall carry a numeric confidence score (0–1). | M
+FR-AGENT-06 | Explanation output | Agent shall provide a human-readable rationale for each proposed mapping/join (e.g., matched field names, value overlap %). | S
+FR-AGENT-07 | Iterative refinement | Users shall be able to correct an agent proposal in natural language or directly in the graph, and the agent shall incorporate the correction into subsequent suggestions in the same session. | S
+ID | Requirement | Description | Priority
+FR-IR-01 | Canonical operator set | IR shall express pipeline logic using a fixed, documented operator set: Filter, Join, Cast, Map, Aggregate, Window, Union. | M
+FR-IR-02 | Engine compilation targets | IR shall be compilable to at least two execution backends (e.g., Spark for batch, Flink for streaming) without change to the IR itself. | M
+FR-IR-03 | Human-readable export | Users shall be able to export the generated IR/code (e.g., PySpark) for manual inspection or editing ("code escape hatch"). | S
+FR-IR-04 | Round-trip editing | Manual edits made in the code escape hatch shall, where syntactically supported, be re-parsed back into the visual graph. | C
+ID | Requirement | Description | Priority
+FR-TC-01 | Pre-execution type validation | System shall reject IR plans containing type-incompatible operations (e.g., date-diff on a String column) before execution. | M
+FR-TC-02 | Join key type compatibility check | System shall verify join keys are of compatible/comparable types and warn (not silently proceed) when coercion is required. | M
+FR-TC-03 | Inline error reporting | Type errors shall be surfaced at the specific node in the graph that caused them, not only as a run-level failure. | M
+ID | Requirement | Description | Priority
+FR-VAL-01 | Required-column tracking | System shall display, at all times during editing, how many of the output contract's required columns are currently satisfied (e.g., "37/39"). | M
+FR-VAL-02 | Nullability & constraint checks | Validator shall check declared nullability, uniqueness, and range constraints against a sample/full run before deployment. | S
+FR-VAL-03 | Breaking-change warning | System shall warn explicitly when a change would drop a currently-required output column ("1 column will be dropped"). | M
+ID | Requirement | Description | Priority
+FR-PREV-01 | Sample preview | System shall render a representative data sample reflecting the current pipeline state at any node, on demand. | M
+FR-PREV-02 | Confidence-threshold gating | Any agent-proposed mapping, join, or transform below a configurable confidence threshold shall require explicit human approval before it can be deployed. | M
+FR-PREV-03 | Bulk review UI | Reviewers shall be able to view all low-confidence proposals for a pipeline in a single consolidated list with approve/reject/edit actions. | S
+FR-PREV-04 | Audit trail of approvals | Every HITL approval/rejection shall be logged with reviewer identity, timestamp, and the reviewed proposal. | M
+ID | Requirement | Description | Priority
+FR-EXE-01 | Batch execution | System shall execute batch pipelines via a distributed engine (Spark) for large-volume datasets. | M
+FR-EXE-02 | Streaming execution | System shall execute streaming pipelines via a stream-processing engine (Flink or equivalent) for continuous sources. | S
+FR-EXE-03 | Lightweight/SQL execution | System shall route small or ad-hoc pipelines to a direct SQL engine to avoid distributed-compute overhead. | C
+FR-EXE-04 | Partial-failure handling | A failed run shall report the exact failing node/operation, not just a generic run failure. | M
+ID | Requirement | Description | Priority
+FR-PROV-01 | Field-level lineage | System shall record, for every output field, the source field(s) and transform chain that produced it. | M
+FR-PROV-02 | Row-level join provenance | For joined rows, system shall record which join rule (and, if AI-inferred, which agent decision and confidence score) produced the match. | M
+FR-PROV-03 | Lineage query interface | Users shall be able to query "why did this output row/value exist" and get a traceable answer without re-running the pipeline. | S
+ID | Requirement | Description | Priority
+FR-ONT-01 | Object type mapping | System shall allow mapping a dataset's rows to a defined business object type (e.g., Supplier, Transaction). | S
+FR-ONT-02 | Relationship/link definition | System shall support defining relationships between object types derived from join keys used in the pipeline. | S
+FR-ONT-03 | Backward propagation | Changes to the ontology mapping shall not silently alter the underlying output dataset without a corresponding pipeline change. | M
+ID | Requirement | Description | Priority
+FR-VER-01 | Branch-based editing | Users shall be able to edit a pipeline on an isolated branch without affecting the live ("Main") version. | M
+FR-VER-02 | Change diffing | System shall show an explicit diff (added/modified/removed transforms and outputs) between a branch and Main before merge. | M
+FR-VER-03 | Propose/review/merge workflow | Merging a branch into Main shall require an explicit proposal and, per configured policy, a second-party review. | M
+FR-VER-04 | Rollback | System shall allow reverting Main to any previously deployed version. | S
+ID | Requirement | Description | Priority
+FR-DEPLOY-01 | Explicit deploy action | Deploying pipeline logic to production shall be a distinct, explicit action separate from saving edits. | M
+FR-DEPLOY-02 | Scheduled & triggered builds | System shall support both scheduled (cron-like) and event-triggered pipeline builds. | M
+FR-DEPLOY-03 | Deployment pre-checks | System shall block deployment if type-checking or contract validation currently fails. | M
+ID | Requirement | Description | Priority
+FR-MON-01 | Run health dashboard | System shall expose run status, duration, and row-count trends per pipeline. | S
+FR-MON-02 | Data-quality metrics | System shall track null-rate, schema-drift, and duplicate-rate metrics per output over time. | S
+FR-MON-03 | SLA/failure alerting | System shall notify designated owners on run failure or SLA breach via configured channels. | M
+ID | Requirement | Description | Priority
+FR-SEC-01 | Role-based access control | System shall enforce role-based permissions (view/edit/approve/deploy) at the pipeline level. | M
+FR-SEC-02 | Column-level security | System shall support restricting visibility of sensitive columns (e.g., tax IDs) by role. | S
+FR-SEC-03 | Full audit logging | All edits, approvals, and deployments shall be logged with actor, timestamp, and change detail. | M
+Stage | Name | Behavior
+1 | Source Identification | Parse the user's natural-language request; match intent against catalogued datasets/systems using metadata and prior usage; return ranked candidate sources.
+2 | Mapping Inference | For each candidate source, propose field-to-canonical mappings using name similarity, type compatibility, and value-distribution profiling.
+3 | Join Inference | Propose join keys and join type across selected sources using key-cardinality analysis, referential patterns, and value-overlap sampling.
+4 | Transform Generation | Generate IR-level operations that satisfy the user's stated intent (filters, derivations, aggregations).
+5 | Confidence Scoring | Attach a 0–1 confidence score to every mapping, join, and transform, computed from the evidence used in stages 2–4.
+6 | Routing | Proposals at or above the confidence threshold flow directly to Preview; proposals below threshold are flagged and require HITL approval before Preview/execution.
+Agent Decision | Risk Level | Rationale | Policy
+Source identification | Low | Wrong dataset is usually obvious in preview | Auto-proceed; shown in UI for confirmation
+Mapping inference | Medium | Type checker catches most hard failures; semantic mismatches can slip through | Auto-proceed above 0.85 confidence; else HITL
+Join inference | High | Two well-typed columns can be joinable and still semantically wrong | HITL required below 0.95 confidence; always shown in Preview regardless of score
+Transform generation | Medium | Logic errors are checkable via preview/dry-run diffing | Auto-proceed above 0.85 confidence; else HITL
+Category | Requirement
+Performance | Batch pipelines on datasets up to [X] million rows shall complete within [Y] minutes; specific targets to be confirmed with infra team based on expected data volumes.
+Scalability | Ingestion and execution layers shall scale horizontally with data volume without pipeline redefinition.
+Reliability | Failed runs shall be automatically retried according to a configurable policy (e.g., 3 retries with backoff) before alerting.
+Availability | The pipeline authoring UI and metadata services shall target 99.5% uptime during business hours.
+Auditability | All schema, mapping, join, and deployment decisions must be reconstructable from logs for at least [retention period, e.g., 1 year].
+Security | Data in transit and at rest shall be encrypted; access shall be governed by the RBAC model in FR-SEC-01.
+Maintainability | New source connectors and canonical types shall be addable via configuration/plugin, not core-code changes.
+Usability | A non-technical business user shall be able to request a basic integration in natural language and reach a reviewable preview without writing code.
+Portability | The IR shall not be tied to a single execution engine, preserving the option to add/replace backends.
+Step | Action
+1 | User submits the request: “Clean and join products, customers, and transactions into a customer lifetime value dataset.”
+2 | Agent (Source ID stage) identifies products.csv, customers.json, and transactions.json as candidate sources and confirms with the user.
+3 | Ingestion Layer connects to all three sources and pulls raw data in native format (CSV, nested JSON, JSON).
+4 | Agent (Mapping Inference) proposes field mappings to the canonical Product, Customer, and Transaction schemas — including flattening the Customer address struct into flat street/city/state fields; mappings above 0.85 confidence auto-apply, others queue for review.
+5 | Normalization Engine applies the approved mappings: trims whitespace on product_name, casts price and units from string to numeric, parses the transaction_date string into a timestamp, and drops residual ingestion artifact columns.
+6 | Agent (Join Inference) proposes joining transactions to products on product_id, with a confidence score; because join risk is High, this always routes to the HITL Preview regardless of score.
+7 | Reviewer inspects the Preview and notices row-count skew (172 joined rows vs. 50 source rows) — exactly the kind of semantic error type checking cannot catch on its own, since product_id and price are both well-typed but product_id is not actually unique.
+8 | Reviewer rejects the proposed join key and directs the agent to rejoin on product_variation_id instead, which uniqueness checking confirms is a true primary key.
+9 | Type Checker and Contract Validator confirm the corrected IR is type-safe and satisfies the required output schema for “customer_lifetime_value.”
+10 | Execution Engine (Spark, given batch volume) runs the validated IR: joins transactions → products → customers, then aggregates (group by customer_id, sum revenue = price × units).
+11 | Output dataset is produced with full field- and row-level provenance recorded, including which join key was used and that it was corrected via HITL review.
+12 | Output is optionally mapped to the Customer object type in the Common Model/Ontology layer.
+13 | Change is proposed, diffed against the current Main pipeline, reviewed, and explicitly deployed.
+Role | View | Edit Pipeline | Approve (HITL) | Deploy
+Business User | Yes | Request only (via agent) | No | No
+Analytical User | Yes | Yes (own branches) | No | No
+Data Engineer | Yes | Yes | Yes | Yes (with review)
+Pipeline Manager / Approver | Yes | Yes | Yes | Yes
+Admin | Yes | Yes | Yes | Yes
+Failure Scenario | System Behavior | Notification
+Source connection failure | Isolate failing source; continue ingesting from remaining sources; mark run partially complete | Alert source owner + pipeline owner
+Schema mismatch at Union | Block merge; surface exact column(s)/type(s) in conflict at the offending node | Inline UI error; no silent drop
+Type-check failure | Block deployment/execution; highlight failing operation in graph | Inline UI error
+Contract validation failure (missing required column) | Block deployment; show required-vs-actual column diff | Inline UI warning (e.g., "37/39 required columns")
+Low-confidence agent proposal | Route to HITL queue; do not auto-execute | Notify assigned reviewer
+Execution/runtime failure | Halt run; report failing node and error detail; retry per policy | Alert pipeline owner and on-call
+Post-deployment data-quality drift | Flag metric breach; do not auto-roll-back by default (configurable) | Alert pipeline owner
+# | Criterion | Ref
+1 | Pipeline can ingest from at least one file-based, one database, and one API source in a single run | FR-ING
+2 | Agent proposes source identification, mapping, and join candidates for a natural-language request with a confidence score attached to each | FR-AGENT
+3 | Any join proposal is held for human review before execution, regardless of confidence score | 5.2
+4 | Output dataset is blocked from deployment if required contract columns are missing | FR-VAL
+5 | Every output row's provenance (source + transform chain + join rule) can be queried after a run | FR-PROV
+6 | A pipeline change can be branched, diffed against Main, and deployed only after explicit approval | FR-VER
+7 | A failed source connector does not prevent ingestion from unrelated, healthy sources in the same run | FR-ING-05

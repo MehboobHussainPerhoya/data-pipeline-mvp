@@ -1,0 +1,11 @@
+sources:
+  - name: erp_export
+    type: csv
+    location: /data/raw/erp_export/
+    access: file_drop
+    owner: "finance_team"
+  - name: vendor_api
+    type: api
+    location: "https://internal-vendor-api.company.com/v1"
+    access: api_key
+    owner: "procurement_team"

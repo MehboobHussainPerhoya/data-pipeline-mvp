@@ -1,0 +1,16 @@
+sources:
+  - name: support_tickets
+    type: csv
+    location: data/raw/support_tickets/customer_support_tickets.csv
+    access: file_download
+    owner: "kaggle_public_dataset"
+  - name: kb_articles
+    type: csv
+    location: data/raw/kb_articles/bitext_customer_support.csv
+    access: file_download
+    owner: "github_public_dataset"
+  - name: support_activity_api
+    type: api
+    location: "https://jsonplaceholder.typicode.com/todos"
+    access: public_no_auth
+    owner: "jsonplaceholder_public_api"
