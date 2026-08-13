@@ -15,6 +15,7 @@ from validation.output_validator import build_output_records, is_safe_to_deploy
 from validation.deploy_gate import deploy_pipeline
 from schema.canonical import SupportCase, KnowledgeArticle
 from schema.output_schema import JoinedCaseOutput
+from agent.orchestrator import AgentOrchestrator
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -32,6 +33,9 @@ if FastMCP is not None:
 # re-running ingestion every time. A real backend would use a proper
 # session/job store; this is deliberately the simplest thing that works.
 _cache = {}
+
+# Agent orchestrator instance — shared across tool calls
+_orchestrator = AgentOrchestrator()
 
 
 @mcp.tool()
@@ -127,6 +131,56 @@ def deploy(approved: bool) -> dict:
         output_path=output_path,
     )
     return {"status": "deployed", "records": len(_cache["output_records"]), "path": output_path}
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: AI Agent Orchestrator MCP tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def agent_orchestrate(request: str) -> dict:
+    """Runs the AI agent orchestrator on a natural-language request.
+    Returns proposals for source identification, mapping, joins, and transforms.
+    Each proposal has a confidence score, rationale, and review status.
+    No proposals are executed — this is planning only."""
+    result = _orchestrator.orchestrate_simple(request)
+    return result.summary()
+
+
+@mcp.tool()
+def agent_get_pending_reviews() -> list[dict]:
+    """Returns all proposals from the last orchestration that are pending
+    human review (below the confidence threshold for auto-apply)."""
+    if "last_orchestration" not in _cache:
+        return []
+    result = _cache["last_orchestration"]
+    pending = [p for p in result.all_proposals if p.get("review_status") == "pending_review"]
+    return pending
+
+
+@mcp.tool()
+def agent_review_proposal(proposal_index: int, action: str, reason: str = "") -> dict:
+    """Approves or rejects a pending agent proposal.
+    action must be 'approve' or 'reject'.
+    If rejecting, a reason must be provided."""
+    if "last_orchestration_proposals" not in _cache:
+        raise RuntimeError("No orchestration result cached — call agent_orchestrate first.")
+    proposals = _cache["last_orchestration_proposals"]
+    if proposal_index < 0 or proposal_index >= len(proposals):
+        raise ValueError(f"Invalid proposal_index {proposal_index}. Range: 0-{len(proposals)-1}")
+
+    proposal = proposals[proposal_index]
+    if action == "approve":
+        proposal.review_status = "approved"
+    elif action == "reject":
+        if not reason:
+            raise ValueError("A reason must be provided when rejecting a proposal.")
+        proposal.review_status = "rejected_by_hitl"
+        proposal.rejection_reason = reason
+    else:
+        raise ValueError(f"Invalid action '{action}'. Must be 'approve' or 'reject'.")
+
+    return proposal.summary()
 
 
 if __name__ == "__main__":
