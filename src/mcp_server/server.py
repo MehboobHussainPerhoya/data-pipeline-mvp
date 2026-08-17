@@ -16,6 +16,7 @@ from validation.deploy_gate import deploy_pipeline
 from schema.canonical import SupportCase, KnowledgeArticle
 from schema.output_schema import JoinedCaseOutput
 from agent.orchestrator import AgentOrchestrator
+from agent.hitl_gate import HITLGate
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -144,43 +145,67 @@ def agent_orchestrate(request: str) -> dict:
     Each proposal has a confidence score, rationale, and review status.
     No proposals are executed — this is planning only."""
     result = _orchestrator.orchestrate_simple(request)
+    # Store raw proposals and create a HITL gate for review tools
+    _cache["last_orchestration"] = result
+    _cache["hitl_gate"] = HITLGate(proposals=result.raw_proposals)
     return result.summary()
 
 
 @mcp.tool()
 def agent_get_pending_reviews() -> list[dict]:
     """Returns all proposals from the last orchestration that are pending
-    human review (below the confidence threshold for auto-apply)."""
-    if "last_orchestration" not in _cache:
+    human review (below the confidence threshold for auto-apply).
+    This is the consolidated bulk review list (FR-PREV-03)."""
+    gate = _cache.get("hitl_gate")
+    if gate is None:
         return []
-    result = _cache["last_orchestration"]
-    pending = [p for p in result.all_proposals if p.get("review_status") == "pending_review"]
-    return pending
+    return gate.list_pending_reviews()
 
 
 @mcp.tool()
-def agent_review_proposal(proposal_index: int, action: str, reason: str = "") -> dict:
-    """Approves or rejects a pending agent proposal.
+def agent_review_proposal(proposal_index: int, action: str, reviewer: str = "unknown", reason: str = "") -> dict:
+    """Approves or rejects a pending agent proposal (FR-PREV-04).
     action must be 'approve' or 'reject'.
+    reviewer: identity of the human reviewer (for audit trail).
     If rejecting, a reason must be provided."""
-    if "last_orchestration_proposals" not in _cache:
+    gate = _cache.get("hitl_gate")
+    if gate is None:
         raise RuntimeError("No orchestration result cached — call agent_orchestrate first.")
-    proposals = _cache["last_orchestration_proposals"]
-    if proposal_index < 0 or proposal_index >= len(proposals):
-        raise ValueError(f"Invalid proposal_index {proposal_index}. Range: 0-{len(proposals)-1}")
 
-    proposal = proposals[proposal_index]
     if action == "approve":
-        proposal.review_status = "approved"
+        proposal = gate.approve(proposal_index=proposal_index, reviewer=reviewer)
     elif action == "reject":
         if not reason:
             raise ValueError("A reason must be provided when rejecting a proposal.")
-        proposal.review_status = "rejected_by_hitl"
-        proposal.rejection_reason = reason
+        proposal = gate.reject(proposal_index=proposal_index, reviewer=reviewer, reason=reason)
     else:
         raise ValueError(f"Invalid action '{action}'. Must be 'approve' or 'reject'.")
 
-    return proposal.summary()
+    # Persist audit trail to disk (FR-PREV-04)
+    audit_path = str(PROJECT_ROOT / "data/processed/hitl_audit_trail.json")
+    gate.persist_audit_trail(audit_path)
+
+    return {"proposal": proposal.summary(), "gate_summary": gate.summary()}
+
+
+@mcp.tool()
+def agent_get_audit_trail() -> list[dict]:
+    """Returns the full HITL audit trail — every approval/rejection with
+    reviewer identity, timestamp, and the reviewed proposal (FR-PREV-04)."""
+    gate = _cache.get("hitl_gate")
+    if gate is None:
+        return []
+    return gate.get_audit_trail()
+
+
+@mcp.tool()
+def agent_get_review_summary() -> dict:
+    """Returns a summary of the current HITL gate state —
+    total proposals, pending, approved, rejected, audit entries."""
+    gate = _cache.get("hitl_gate")
+    if gate is None:
+        raise RuntimeError("No orchestration result cached — call agent_orchestrate first.")
+    return gate.summary()
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ from .mapping_inference import MappingInference, SourceFieldProfile, CanonicalFi
 from .join_inference import JoinInference, JoinKeyCandidate
 from .transform_generation import TransformGeneration
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Any
 
 
 class OrchestratorResult(BaseModel):
@@ -34,6 +34,7 @@ class OrchestratorResult(BaseModel):
     join_proposals: list[dict] = []
     transform_proposals: list[dict] = []
     all_proposals: list[dict] = []
+    raw_proposals: list[Any] = []      # actual Proposal objects for HITLGate
     auto_approved_count: int = 0
     pending_review_count: int = 0
     rejected_count: int = 0
@@ -163,6 +164,7 @@ class AgentOrchestrator:
             join_proposals=[p.summary() for p in join_proposals],
             transform_proposals=[p.summary() for p in transform_proposals],
             all_proposals=[p.summary() for p in all_proposals],
+            raw_proposals=all_proposals,
             auto_approved_count=auto_approved,
             pending_review_count=pending_review,
             rejected_count=rejected,

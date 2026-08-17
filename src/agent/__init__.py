@@ -26,6 +26,7 @@ from .mapping_inference import MappingInference, SourceFieldProfile, CanonicalFi
 from .join_inference import JoinInference, JoinKeyCandidate
 from .transform_generation import TransformGeneration
 from .orchestrator import AgentOrchestrator, OrchestratorResult
+from .hitl_gate import HITLGate, AuditEntry
 
 __all__ = [
     "Proposal", "ProposalType", "ReviewStatus",
@@ -36,4 +37,5 @@ __all__ = [
     "JoinInference", "JoinKeyCandidate",
     "TransformGeneration",
     "AgentOrchestrator", "OrchestratorResult",
+    "HITLGate", "AuditEntry",
 ]

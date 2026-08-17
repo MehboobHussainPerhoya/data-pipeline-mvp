@@ -72,7 +72,7 @@ def _infer_type(raw_values: list) -> str:
     # Check Integer
     try:
         int(non_null[0])
-        int_like = all(self._is_int(v) for v in non_null[:50])
+        int_like = all(_is_int(v) for v in non_null[:50])
         if int_like:
             return "Integer"
     except (ValueError, TypeError):
@@ -81,7 +81,7 @@ def _infer_type(raw_values: list) -> str:
     # Check Double
     try:
         float(non_null[0])
-        float_like = all(self._is_float(v) for v in non_null[:50])
+        float_like = all(_is_float(v) for v in non_null[:50])
         if float_like:
             return "Double"
     except (ValueError, TypeError):
