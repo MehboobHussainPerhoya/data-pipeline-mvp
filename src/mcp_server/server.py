@@ -17,6 +17,8 @@ from schema.canonical import SupportCase, KnowledgeArticle
 from schema.output_schema import JoinedCaseOutput
 from agent.orchestrator import AgentOrchestrator
 from agent.hitl_gate import HITLGate
+from provenance.lineage_tracker import LineageTracker
+from provenance.query import LineageQuery
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -206,6 +208,55 @@ def agent_get_review_summary() -> dict:
     if gate is None:
         raise RuntimeError("No orchestration result cached — call agent_orchestrate first.")
     return gate.summary()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Provenance & Lineage Tracking MCP tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_lineage(dataset_name: str, field_name: str = None) -> dict:
+    """Returns lineage information for an output dataset or specific field.
+    Traces the full derivation chain back to source fields without re-running
+    the pipeline (FR-PROV-03).
+    dataset_name: the output dataset to trace.
+    field_name: optional specific field to trace (if omitted, traces the whole dataset)."""
+    tracker = _cache.get('lineage_tracker')
+    if tracker is None:
+        raise RuntimeError('No lineage data available - run a pipeline with lineage tracking first.')
+    query = LineageQuery(tracker.store)
+    if field_name:
+        chain = query.trace_field(dataset_name, field_name)
+        explanation = query.explain_field(dataset_name, field_name)
+    else:
+        chain = query.trace_dataset(dataset_name)
+        explanation = f'Traced {len(chain)} lineage records for dataset {dataset_name}.'
+    return {
+        'records': [r.model_dump() for r in chain],
+        'explanation': explanation,
+        'record_count': len(chain),
+    }
+
+
+@mcp.tool()
+def get_join_provenance() -> list[dict]:
+    """Returns provenance for all join operations in the last pipeline run.
+    For each join: the join rule, source (manual/agent/human), confidence score,
+    and review status (FR-PROV-02)."""
+    tracker = _cache.get('lineage_tracker')
+    if tracker is None:
+        raise RuntimeError('No lineage data available - run a pipeline with lineage tracking first.')
+    query = LineageQuery(tracker.store)
+    return query.get_join_provenance()
+
+
+@mcp.tool()
+def get_lineage_summary() -> dict:
+    """Returns a summary of all lineage records from the last pipeline run."""
+    tracker = _cache.get('lineage_tracker')
+    if tracker is None:
+        raise RuntimeError('No lineage data available - run a pipeline with lineage tracking first.')
+    return tracker.summary()
 
 
 if __name__ == "__main__":

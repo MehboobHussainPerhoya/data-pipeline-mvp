@@ -39,6 +39,7 @@ class IRExecutor:
         self._connectors: dict[str, Callable] = {}
         self._mappers: dict[str, Callable] = {}
         self._transforms = builtin_transform_registry
+        self._lineage_tracker = None  # Phase 6
 
     # --- Registration ---
 
@@ -49,6 +50,10 @@ class IRExecutor:
     def register_mapper(self, name: str, func: Callable) -> None:
         """Register a named mapper function for normalization."""
         self._mappers[name] = func
+
+    def attach_lineage_tracker(self, tracker) -> None:
+        """Attach a LineageTracker for provenance recording (Phase 6)."""
+        self._lineage_tracker = tracker
 
     # --- Execution ---
 
@@ -71,7 +76,14 @@ class IRExecutor:
 
         # Step 2: Execute each operator in order
         for i, step in enumerate(ir.steps):
-            datasets[step.output] = self._execute_operator(step, datasets)
+            datasets_before = dict(datasets)
+            output = self._execute_operator(step, datasets)
+            datasets[step.output] = output
+            if self._lineage_tracker is not None:
+                self._lineage_tracker.record_execution(
+                    step=step, step_index=i,
+                    datasets_before=datasets_before, output_data=output,
+                )
 
         return datasets
 
