@@ -125,3 +125,28 @@
   by the user directly, not delegated.
 
   
+## FSD-Extension Phase 6 — Provenance & Lineage Tracking
+- LineageTracker hooks into the IR executor (src/ir/executor.py via
+  attach_lineage_tracker()) and records a LineageRecord after every
+  operator execution: input dataset/fields -> output dataset/field,
+  operator type, and parameters (FR-PROV-01).
+- For Join operators specifically, the tracker pulls source_origin,
+  confidence, review_status, and rejection_reason directly from the
+  JoinOperator itself (not re-derived), since JoinInference (Phase 4)
+  already sets these fields when creating a join from a Proposal
+  (FR-PROV-02).
+- Both the rejected product_id join (confidence 0.61, non-unique) and the
+  approved product_variation_id join (confidence 0.85, unique) are
+  retained in the lineage store — not just the winner — satisfying the
+  FSD's audit requirement to keep rejected proposals visible.
+- LineageQuery.trace_field()/explain_field() answer "why does this output
+  exist" by walking the stored records, without re-running the pipeline
+  (FR-PROV-03).
+- Verified: 9/9 phase6 smoke tests passed, including the CLV scenario test
+  proving product_variation_id ranks above product_id with the correct
+  confidence scores and provenance retained for both.
+- Note: 3 files (lineage_store.py, lineage_tracker.py, query.py) were saved
+  with a UTF-8 BOM, which breaks plain ast.parse() calls without an
+  explicit encoding='utf-8' argument — cosmetic, not a functional bug,
+  confirmed by both test_phase6.py and pytest running these files
+  successfully.

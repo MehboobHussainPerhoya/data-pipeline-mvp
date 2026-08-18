@@ -19,6 +19,14 @@ from agent.orchestrator import AgentOrchestrator
 from agent.hitl_gate import HITLGate
 from provenance.lineage_tracker import LineageTracker
 from provenance.query import LineageQuery
+from ir.pipeline_definition import support_case_pipeline_ir
+from ontology.object_types import OBJECT_TYPE_REGISTRY, get_object_type
+from ontology.relationships import derive_relationships_from_ir
+from ontology.mapper import OntologyMapper
+from versioning.branch import BranchStore
+from versioning.diff import diff_pipeline_irs
+from versioning.proposal import ProposalStore, ProposalStatus
+from versioning.rollback import VersionHistory
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -39,6 +47,18 @@ _cache = {}
 
 # Agent orchestrator instance — shared across tool calls
 _orchestrator = AgentOrchestrator()
+
+# ---------------------------------------------------------------------------
+# Phase 8: Versioning / Proposal & Diff System (FSD 4.13)
+# Branch-based editing, diffing, propose/review/merge, rollback.
+# These manage PIPELINE LOGIC changes only — they do NOT deploy output.
+# Deploying output still requires deploy_gate.py (is_safe=True AND approved=True).
+# Merge and deploy are distinct actions by design.
+# ---------------------------------------------------------------------------
+_branch_store = BranchStore(main_ir=support_case_pipeline_ir)
+_proposal_store = ProposalStore(branch_store=_branch_store)
+_version_history = VersionHistory(branch_store=_branch_store)
+_version_history.snapshot_initial()  # capture the starting Main as version 1
 
 
 @mcp.tool()
@@ -257,6 +277,200 @@ def get_lineage_summary() -> dict:
     if tracker is None:
         raise RuntimeError('No lineage data available - run a pipeline with lineage tracking first.')
     return tracker.summary()
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Common Model / Ontology Layer MCP tools (FSD 4.12)
+# These tools are strictly READ-ONLY over pipeline output and IR (FR-ONT-03).
+# ---------------------------------------------------------------------------
+
+_ontology_mapper = OntologyMapper()
+
+
+@mcp.tool()
+def ontology_list_object_types() -> list[dict]:
+    """Lists all defined business object types in the ontology layer (FR-ONT-01).
+    Each type references a SchemaDefinition from the Schema Registry — fields
+    are not redefined here."""
+    return [obj_type.to_dict() for obj_type in OBJECT_TYPE_REGISTRY.values()]
+
+
+@mcp.tool()
+def ontology_map_records(object_type_name: str) -> dict:
+    """Maps the cached pipeline output records to a business object type (FR-ONT-01).
+    Also derives relationships from the pipeline IR's Join operators (FR-ONT-02).
+    This is a READ-ONLY annotation over existing output — it does not mutate
+    the output, the IR, or trigger re-execution (FR-ONT-03).
+    Must be called after run_pipeline()."""
+    if "output_records" not in _cache:
+        raise RuntimeError("No pipeline result cached — call run_pipeline() first.")
+
+    result = _ontology_mapper.map_records(
+        records=_cache["output_records"],
+        object_type_name=object_type_name,
+        ir=support_case_pipeline_ir,
+    )
+    return result.to_dict()
+
+
+@mcp.tool()
+def ontology_get_relationships() -> list[dict]:
+    """Derives relationships between object types from the pipeline IR's Join
+    operators (FR-ONT-02). Each relationship records the exact join key pair
+    that produced it — relationships are not invented separately.
+    This is a READ-ONLY operation over the IR (FR-ONT-03)."""
+    relationships = derive_relationships_from_ir(support_case_pipeline_ir)
+    return [rel.to_dict() for rel in relationships]
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Versioning / Proposal & Diff System MCP tools (FSD 4.13)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def versioning_list_branches() -> list[dict]:
+    """Lists all branches (not including Main) with their summaries (FR-VER-01).
+    Each branch is an isolated copy of a PipelineIR that can be edited
+    without affecting the live Main version."""
+    return [b.summary() for b in _branch_store.list_branches()]
+
+
+@mcp.tool()
+def versioning_get_main() -> dict:
+    """Returns a summary of the current Main pipeline IR (FR-VER-01).
+    This is the live pipeline definition that runs when run_pipeline() is called."""
+    return _branch_store.get_main().to_summary()
+
+
+@mcp.tool()
+def versioning_create_branch(branch_name: str, from_branch: str = "Main") -> dict:
+    """Creates a new branch as an isolated copy of Main (or another branch) (FR-VER-01).
+    Edits to the branch do not affect Main until merged via the proposal workflow.
+    branch_name: the name for the new branch (cannot be 'Main').
+    from_branch: the source to copy from (default 'Main')."""
+    branch = _branch_store.create_branch(name=branch_name, from_branch=from_branch)
+    return branch.summary()
+
+
+@mcp.tool()
+def versioning_get_branch(branch_name: str) -> dict:
+    """Returns a summary of a specific branch including its pipeline IR (FR-VER-01).
+    Raises an error if the branch does not exist."""
+    branch = _branch_store.get_branch(name=branch_name)
+    return {**branch.summary(), "ir_summary": branch.ir.to_summary()}
+
+
+@mcp.tool()
+def versioning_get_branch_ir(branch_name: str) -> dict:
+    """Returns the full PipelineIR of a branch as JSON for inspection or editing (FR-VER-01).
+    The returned IR can be modified and saved back via versioning_update_branch_ir."""
+    branch = _branch_store.get_branch(name=branch_name)
+    return {"branch_name": branch_name, "ir_json": branch.ir.to_json()}
+
+
+@mcp.tool()
+def versioning_update_branch_ir(branch_name: str, ir_json: str) -> dict:
+    """Replaces a branch's PipelineIR with a new version provided as JSON (FR-VER-01).
+    This is how edits to a branch are saved. The branch must exist and not be merged.
+    ir_json: a JSON string representing the new PipelineIR."""
+    from ir.pipeline_ir import PipelineIR
+    new_ir = PipelineIR.model_validate_json(ir_json)
+    branch = _branch_store.update_branch(name=branch_name, ir=new_ir)
+    return branch.summary()
+
+
+@mcp.tool()
+def versioning_diff_branch(branch_name: str) -> dict:
+    """Shows an explicit operator-level diff between a branch and Main (FR-VER-02).
+    Reports added, removed, and modified operators and input sources.
+    This is a structural diff, not a text diff — it shows which Join/Cast/Map/etc.
+    steps changed, in a form a human reviewer can read."""
+    branch = _branch_store.get_branch(name=branch_name)
+    diff = diff_pipeline_irs(_branch_store.get_main(), branch.ir)
+    return diff.summary()
+
+
+@mcp.tool()
+def versioning_create_proposal(proposer: str, branch_name: str) -> dict:
+    """Creates a proposal to merge a branch into Main (FR-VER-03).
+    The diff is computed and frozen at proposal time so the reviewer sees
+    exactly what was proposed. The proposal starts in 'open' status.
+    proposer: identity of who is proposing the merge.
+    branch_name: the branch to merge."""
+    proposal = _proposal_store.create_proposal(proposer=proposer, branch_name=branch_name)
+    return proposal.summary()
+
+
+@mcp.tool()
+def versioning_list_proposals(status: str = None) -> list[dict]:
+    """Lists all proposals, optionally filtered by status (FR-VER-03).
+    status: if provided, one of 'open', 'approved', 'rejected', 'merged', 'superseded'."""
+    if status:
+        status_enum = ProposalStatus(status)
+    else:
+        status_enum = None
+    return [p.summary() for p in _proposal_store.list_proposals(status=status_enum)]
+
+
+@mcp.tool()
+def versioning_review_proposal(proposal_id: int, reviewer: str, action: str, reason: str = "") -> dict:
+    """Reviews a proposal — approves or rejects it (FR-VER-03).
+    Enforces second-party review: reviewer MUST differ from the proposer.
+    proposal_id: the proposal to review.
+    reviewer: identity of the reviewer (must be different from the proposer).
+    action: 'approve' or 'reject'.
+    reason: optional reason (required if rejecting)."""
+    proposal = _proposal_store.review_proposal(
+        proposal_id=proposal_id,
+        reviewer=reviewer,
+        action=action,
+        reason=reason,
+    )
+    return proposal.summary()
+
+
+@mcp.tool()
+def versioning_merge_proposal(proposal_id: int) -> dict:
+    """Merges an approved proposal's branch into Main (FR-VER-03).
+    The proposal must have been approved by a reviewer distinct from the proposer.
+
+    IMPORTANT: This is a PIPELINE LOGIC change only — it does NOT deploy output.
+    After merging, the user must still run_pipeline() and deploy() through
+    deploy_gate.py (is_safe=True AND approved=True) to produce and deploy output.
+    Merge and deploy are distinct actions by design."""
+    proposal = _proposal_store.get_proposal(proposal_id)
+    branch_name = proposal.branch_name
+
+    # Snapshot the current Main BEFORE the merge replaces it
+    current_main = _branch_store.get_main()
+    _version_history.snapshot_pre_merge(previous_main_ir=current_main, branch_name=branch_name)
+
+    # Perform the merge (replaces Main with the branch's IR)
+    proposal = _proposal_store.merge_proposal(proposal_id=proposal_id)
+
+    # Snapshot the new Main AFTER the merge
+    _version_history.snapshot_post_merge(branch_name=branch_name)
+
+    return proposal.summary()
+
+
+@mcp.tool()
+def versioning_list_versions() -> list[dict]:
+    """Lists all version snapshots of Main (FR-VER-04).
+    Each snapshot captures Main's PipelineIR at a point in time — initial,
+    pre-merge, post-merge, or rollback."""
+    return [s.summary() for s in _version_history.list_versions()]
+
+
+@mcp.tool()
+def versioning_rollback(version: int) -> dict:
+    """Reverts Main to a previously deployed version (FR-VER-04).
+    This is a PIPELINE LOGIC change only — it does NOT deploy output.
+    After rollback, the user must still run_pipeline() and deploy() to
+    produce output from the reverted logic.
+    version: the version number to revert to (see versioning_list_versions)."""
+    snapshot = _version_history.rollback_to(version=version)
+    return snapshot.summary()
 
 
 if __name__ == "__main__":
