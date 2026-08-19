@@ -150,3 +150,96 @@
   explicit encoding='utf-8' argument — cosmetic, not a functional bug,
   confirmed by both test_phase6.py and pytest running these files
   successfully.
+
+
+## FSD-Extension Phase 7 — Ontology / Common Model Layer
+- BusinessObjectType references an existing SchemaDefinition by reference,
+  not by copying fields — 5 object types defined: SupportCase, KnowledgeArticle,
+  Customer, Product, Transaction. Product's identity field is explicitly
+  product_variation_id, not product_id (FR-ONT-01).
+- derive_relationships_from_ir() builds Relationship objects directly from
+  JoinOperator/JoinKeyPair data already in the IR — never redefines join
+  logic separately, so relationships can't drift from the actual pipeline
+  (FR-ONT-02). Provenance (source_origin, confidence, review_status) is
+  pulled from the operator, same pattern as Phase 6's lineage tracker.
+- FR-ONT-03 (highest-priority requirement this phase) enforced structurally:
+  OntologyMapper takes read-only record/IR snapshots, has no write/mutate/
+  deploy method, and returns ir_unchanged=True/output_unchanged=True flags.
+  Verified via before/after hash comparison in test_phase7.py, not just
+  a self-reported flag.
+- Verified: Transaction->Product relationship correctly shows
+  left_key=product_id (the real FK name on the transactions side),
+  right_key=product_variation_id (the corrected join target) — matches
+  FSD Appendix A's human-corrected join, source_origin=human_override.
+
+
+## FSD-Extension Phase 8 — Versioning / Proposal & Diff System
+- Branch-based editing: BranchStore deep-copies a PipelineIR into an isolated
+  named branch; editing a branch never touches Main until an explicit merge
+  (FR-VER-01).
+- Operator-level diffing: diff_pipeline_irs() matches operators by output
+  name; added/removed/modified detected per-operator, with Join operators
+  specifically decoding which mapping entries changed (e.g. "Product
+  inquiry": "ORDER" -> "PRODUCT") for human-readable review (FR-VER-02).
+- Propose/review/merge: VersionProposal freezes the diff at creation time;
+  review requires reviewer != proposer (second-party review enforced, not
+  just suggested); merge requires APPROVED status (FR-VER-03).
+- Rollback: VersionHistory snapshots Main pre/post every merge; rollback_to()
+  reverts and records the rollback itself as a new snapshot for audit
+  (FR-VER-04).
+- Hard separation maintained: merge_proposal() only calls
+  branch_store.set_main() — changes pipeline LOGIC only. It never calls
+  run_pipeline(), validate_pipeline(), or deploy_pipeline(). Deploying
+  output after a merge still requires the full separate
+  run -> validate -> deploy(approved=True) sequence through deploy_gate.py,
+  unchanged.
+- Standing rule from Phase 7's bug applied throughout: no function returns
+  None for a not-found case — get_branch()/get_proposal() raise KeyError,
+  diff_pipeline_irs() raises ValueError on None input.
+
+git add . && git commit -m "Phase 8 complete: versioning/branch/diff/proposal/rollback, merge-vs-deploy separation verified" && git push
+
+
+## FSD-Extension Phase 9 — Deployment Module (FSD 4.14)
+- FR-DEPLOY-01 (explicit deploy action) and FR-DEPLOY-03 (deployment
+  pre-checks) confirmed already satisfied by existing deploy_gate.py —
+  its is_safe=True AND approved=True requirement is already an explicit,
+  separate action gated on validation passing. No new code written for
+  these two requirements; cited exact existing code in the state-confirmation
+  report.
+- FR-DEPLOY-02 (scheduled & triggered builds) implemented as new
+  src/deployment/scheduler.py: BuildScheduler supports cron-like scheduled
+  builds (check_schedules) and event-triggered builds (trigger_event).
+  A build = run pipeline + validate. A build NEVER deploys on its own.
+- Critical invariant enforced structurally: BuildScheduler has NO deploy
+  method and NO import of deploy_gate. A scheduled/triggered build produces
+  a BuildResult (candidate output) that must still pass through
+  deploy_gate.py approval gate (is_safe=True AND approved=True) before
+  anything is actually deployed. Scheduling automates the build, never the
+  approval. Verified by test_scheduler_has_no_deploy_method and
+  test_scheduler_does_not_import_deploy_gate (both assert on actual
+  structure/source, not docstrings).
+- deploy_gate.py extension (the ONLY change to that file): added two
+  optional parameters (version_ref, deployed_by) recorded in the audit
+  log for traceability. The core gating logic (the two if-not blocks)
+  is byte-for-byte identical before and after. When the new params are
+  None (the defaults), the audit log format is character-for-character
+  identical to the previous format — fully backward compatible.
+- server.py: deploy() tool extended to pass version_ref and deployed_by
+  through to deploy_pipeline(). 12 new scheduler MCP tools added
+  (scheduler_add_schedule, scheduler_add_event_trigger,
+  scheduler_check_schedules, scheduler_trigger_event,
+  scheduler_trigger_manual, scheduler_get_build_results,
+  scheduler_get_latest_build, scheduler_list_schedules,
+  scheduler_list_event_triggers, scheduler_enable_schedule,
+  scheduler_disable_schedule, scheduler_summary).
+- Cron expressions: 5-field format (minute hour dom month dow), each field
+  supports * (any), single number, or comma-separated numbers. Deliberately
+  minimal — no third-party cron library. Range/step syntax could be added
+  later if needed.
+- AUDIT FINDING: the edit_existing_file tool introduced a typo
+  (output_path:.str with a stray colon) into deploy_gate.py during the
+  initial edit. Caught immediately by re-reading the file after the edit,
+  fixed with a single_find_and_replace before proceeding. This reinforces
+  the standing rule: always re-read a file after editing it, never trust
+  the tool success message.

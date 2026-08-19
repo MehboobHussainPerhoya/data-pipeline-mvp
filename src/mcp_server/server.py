@@ -27,6 +27,7 @@ from versioning.branch import BranchStore
 from versioning.diff import diff_pipeline_irs
 from versioning.proposal import ProposalStore, ProposalStatus
 from versioning.rollback import VersionHistory
+from deployment.scheduler import BuildScheduler
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -59,6 +60,42 @@ _branch_store = BranchStore(main_ir=support_case_pipeline_ir)
 _proposal_store = ProposalStore(branch_store=_branch_store)
 _version_history = VersionHistory(branch_store=_branch_store)
 _version_history.snapshot_initial()  # capture the starting Main as version 1
+
+# ---------------------------------------------------------------------------
+# Phase 9: Build Scheduler (FSD 4.14, FR-DEPLOY-02)
+# Scheduled (cron-like) and event-triggered BUILDS only — never deploys.
+# A scheduled/triggered build produces a candidate output that must still
+# pass through deploy_gate.py (is_safe=True AND approved=True) before
+# anything is actually deployed. Scheduling automates the build, never the
+# approval.
+# ---------------------------------------------------------------------------
+_build_scheduler = BuildScheduler()
+
+
+def _run_pipeline_for_scheduler() -> tuple[list[JoinedCaseOutput], list[tuple]]:
+    """
+    Build function for the scheduler — runs the full pipeline and returns
+    (output_records, errors). This is what scheduled/triggered builds execute.
+    It does NOT deploy — the scheduler validates the result and stores it as
+    a candidate for later explicit deployment.
+    """
+    tickets_raw = read_support_tickets(str(PROJECT_ROOT / "data/raw/support_tickets/customer_support_tickets.csv"))
+    kb_raw = read_kb_articles(str(PROJECT_ROOT / "data/raw/kb_articles/bitext_customer_support.csv"))
+    api_raw = read_support_activity_api(
+        fallback_path=str(PROJECT_ROOT / "data/sample/support_activity_api/sample.json")
+    )
+
+    cases = [map_ticket_to_supportcase(r) for r in tickets_raw] + \
+            [map_api_to_supportcase(r) for r in api_raw]
+    articles = [map_kb_to_knowledgearticle(r, i) for i, r in enumerate(kb_raw)]
+    joined = join_cases_to_articles(cases, articles, TICKET_TYPE_TO_KB_CATEGORY)
+    output_records, errors = build_output_records(joined)
+
+    # Cache the result so validate_pipeline/deploy can use it after a build
+    _cache["output_records"] = output_records
+    _cache["errors"] = errors
+
+    return output_records, errors
 
 
 @mcp.tool()
@@ -136,10 +173,14 @@ def preview_output(limit: int = 10) -> list[dict]:
 
 
 @mcp.tool()
-def deploy(approved: bool) -> dict:
+def deploy(approved: bool, deployed_by: str = "", version_ref: str = "") -> dict:
     """Deploys the final output. WRITE ACTION — requires validate_pipeline()
     to have passed AND approved=True to be explicitly set by the caller.
-    There is no bypass: missing either condition blocks the deploy."""
+    There is no bypass: missing either condition blocks the deploy.
+
+    deployed_by: identity of the person approving the deploy (for audit log).
+    version_ref: the version of the pipeline being deployed (for audit log).
+    Both are optional metadata — they do not affect the gating condition."""
     if "output_records" not in _cache:
         raise RuntimeError("No pipeline result cached — call run_pipeline() first.")
     if "is_safe" not in _cache:
@@ -152,6 +193,8 @@ def deploy(approved: bool) -> dict:
         _cache["safety_reasons"],
         approved=approved,
         output_path=output_path,
+        version_ref=version_ref if version_ref else None,
+        deployed_by=deployed_by if deployed_by else None,
     )
     return {"status": "deployed", "records": len(_cache["output_records"]), "path": output_path}
 
@@ -471,6 +514,135 @@ def versioning_rollback(version: int) -> dict:
     version: the version number to revert to (see versioning_list_versions)."""
     snapshot = _version_history.rollback_to(version=version)
     return snapshot.summary()
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Build Scheduler MCP tools (FSD 4.14, FR-DEPLOY-02)
+# Scheduled (cron-like) and event-triggered BUILDS only — never deploys.
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def scheduler_add_schedule(name: str, cron_expression: str) -> dict:
+    """Adds a cron-like scheduled build (FR-DEPLOY-02).
+    The build runs the pipeline and validates the result — it does NOT deploy.
+    Deploying the output still requires a separate deploy() call with approved=True.
+
+    name: unique name for this schedule.
+    cron_expression: 5-field cron expression (minute hour day-of-month month day-of-week).
+    Each field: * (any), a single number, or comma-separated numbers (e.g., "0,30").
+    Examples: "0 * * * *" (top of every hour), "30 9 * * 1-5" (9:30 Mon-Fri)."""
+    job = _build_scheduler.add_schedule(
+        name=name,
+        cron_expression=cron_expression,
+        build_fn=_run_pipeline_for_scheduler,
+    )
+    return job.summary()
+
+
+@mcp.tool()
+def scheduler_add_event_trigger(name: str, event_name: str) -> dict:
+    """Adds an event-triggered build (FR-DEPLOY-02).
+    When the event fires (via scheduler_trigger_event), the build runs the
+    pipeline and validates the result — it does NOT deploy.
+    Deploying the output still requires a separate deploy() call with approved=True.
+
+    name: unique name for this trigger.
+    event_name: the event that triggers the build (e.g., "data_arrived")."""
+    trigger = _build_scheduler.add_event_trigger(
+        name=name,
+        event_name=event_name,
+        build_fn=_run_pipeline_for_scheduler,
+    )
+    return trigger.summary()
+
+
+@mcp.tool()
+def scheduler_check_schedules() -> list[dict]:
+    """Checks all scheduled builds and runs any that are due now (FR-DEPLOY-02).
+    Returns a list of build results for any builds that were triggered.
+    Builds that are disabled or not due are skipped.
+    Triggered builds are NOT deployed — they produce candidate outputs only."""
+    results = _build_scheduler.check_schedules()
+    return [r.summary() for r in results]
+
+
+@mcp.tool()
+def scheduler_trigger_event(event_name: str) -> list[dict]:
+    """Fires an event, triggering all builds subscribed to that event (FR-DEPLOY-02).
+    Returns a list of build results for all builds that were triggered.
+    Triggered builds are NOT deployed — they produce candidate outputs only.
+    Deploying requires a separate deploy() call with approved=True.
+
+    event_name: the event that occurred (e.g., "data_arrived")."""
+    results = _build_scheduler.trigger_event(event_name)
+    return [r.summary() for r in results]
+
+
+@mcp.tool()
+def scheduler_trigger_manual(name: str) -> dict:
+    """Manually triggers a scheduled build by name, regardless of whether its
+    cron schedule is due (FR-DEPLOY-02). This is for ad-hoc/test runs.
+    The build is NOT deployed — it produces a candidate output only.
+    Deploying requires a separate deploy() call with approved=True.
+
+    name: the schedule to trigger manually."""
+    result = _build_scheduler.trigger_manual(name)
+    return result.summary()
+
+
+@mcp.tool()
+def scheduler_get_build_results() -> list[dict]:
+    """Returns all build results from scheduled/triggered builds (FR-DEPLOY-02).
+    These are candidate outputs — built and validated but NOT deployed.
+    Deploying requires a separate deploy() call with approved=True."""
+    return [r.summary() for r in _build_scheduler.get_build_results()]
+
+
+@mcp.tool()
+def scheduler_get_latest_build() -> dict:
+    """Returns the most recent build result (FR-DEPLOY-02).
+    This is a candidate output — built and validated but NOT deployed.
+    Deploying requires a separate deploy() call with approved=True.
+    Raises RuntimeError if no builds have run."""
+    result = _build_scheduler.get_latest_build()
+    if result is None:
+        raise RuntimeError("No builds have been triggered — call scheduler_trigger_event or scheduler_check_schedules first.")
+    return result.summary()
+
+
+@mcp.tool()
+def scheduler_list_schedules() -> list[dict]:
+    """Lists all scheduled builds (FR-DEPLOY-02)."""
+    return _build_scheduler.list_schedules()
+
+
+@mcp.tool()
+def scheduler_list_event_triggers() -> list[dict]:
+    """Lists all event triggers (FR-DEPLOY-02)."""
+    return _build_scheduler.list_event_triggers()
+
+
+@mcp.tool()
+def scheduler_enable_schedule(name: str) -> dict:
+    """Enables a scheduled build (FR-DEPLOY-02).
+    name: the schedule to enable."""
+    job = _build_scheduler.enable_schedule(name)
+    return job.summary()
+
+
+@mcp.tool()
+def scheduler_disable_schedule(name: str) -> dict:
+    """Disables a scheduled build (FR-DEPLOY-02).
+    name: the schedule to disable."""
+    job = _build_scheduler.disable_schedule(name)
+    return job.summary()
+
+
+@mcp.tool()
+def scheduler_summary() -> dict:
+    """Returns a summary of the scheduler state — schedules, triggers, and
+    total builds run (FR-DEPLOY-02)."""
+    return _build_scheduler.summary()
 
 
 if __name__ == "__main__":

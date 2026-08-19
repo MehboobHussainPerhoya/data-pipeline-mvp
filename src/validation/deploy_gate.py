@@ -1,3 +1,4 @@
+
 import json
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,8 @@ def deploy_pipeline(
     safety_reasons: list[str],
     approved: bool,
     output_path: str,
+    version_ref: str | None = None,
+    deployed_by: str | None = None,
 ) -> None:
     """
     The single choke point all deployment must pass through.
@@ -16,6 +19,10 @@ def deploy_pipeline(
     This function's shape (safety check + explicit approval + audit log) is
     what becomes the MCP 'deploy' tool in Phase 4 — write it exactly as
     strict as it needs to be permanently, since that's what carries forward.
+
+    Phase 9 extension: version_ref and deployed_by are optional metadata
+    recorded in the audit log for traceability. They do NOT affect the
+    gating condition — is_safe AND approved remains the only gate.
     """
     if not is_safe:
         raise RuntimeError(f"Deploy blocked — output failed safety checks: {safety_reasons}")
@@ -32,6 +39,15 @@ def deploy_pipeline(
     # Audit log — every deploy must be traceable
     audit_path = path.parent / "deploy_audit_log.txt"
     with open(audit_path, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now().isoformat()} | Deployed {len(output_records)} records to {output_path} | approved=True\n")
+        parts = [
+            f"{datetime.now().isoformat()}",
+            f"Deployed {len(output_records)} records to {output_path}",
+            "approved=True",
+        ]
+        if version_ref is not None:
+            parts.append(f"version={version_ref}")
+        if deployed_by is not None:
+            parts.append(f"deployed_by={deployed_by}")
+        f.write(" | ".join(parts) + "\n")
 
     print(f"Deployed {len(output_records)} records to {output_path}")
