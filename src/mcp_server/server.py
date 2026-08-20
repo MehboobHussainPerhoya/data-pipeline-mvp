@@ -6,6 +6,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))  # so 'src' modules im
 from ingestion.tickets_connector import read_support_tickets
 from ingestion.kb_connector import read_kb_articles
 from ingestion.api_connector import read_support_activity_api
+from ingestion.failure_isolation import ingest_with_isolation, run_ingestion_isolated, IngestionRunResult
+from ingestion.cdc import HighWaterMarkTracker
 from normalization.tickets_mapper import map_ticket_to_supportcase
 from normalization.kb_mapper import map_kb_to_knowledgearticle
 from normalization.api_mapper import map_api_to_supportcase
@@ -99,6 +101,12 @@ _rbac = RBACManager()
 _column_security = ColumnSecurityManager()
 _audit_logger = AuditLogger(log_path=str(PROJECT_ROOT / "data/processed/security_audit_log.jsonl"))
 
+# ---------------------------------------------------------------------------
+# Phase 12: Incremental/CDC ingestion (FR-ING-03)
+# High-water mark tracker for incremental pulls.
+# ---------------------------------------------------------------------------
+_cdc_tracker = HighWaterMarkTracker(state_path=str(PROJECT_ROOT / "data/processed/cdc_state.json"))
+
 
 def _run_pipeline_for_scheduler() -> tuple[list[JoinedCaseOutput], list[tuple]]:
     """
@@ -106,15 +114,18 @@ def _run_pipeline_for_scheduler() -> tuple[list[JoinedCaseOutput], list[tuple]]:
     (output_records, errors). This is what scheduled/triggered builds execute.
     It does NOT deploy — the scheduler validates the result and stores it as
     a candidate for later explicit deployment.
-    """
-    tickets_raw = read_support_tickets(str(PROJECT_ROOT / "data/raw/support_tickets/customer_support_tickets.csv"))
-    kb_raw = read_kb_articles(str(PROJECT_ROOT / "data/raw/kb_articles/bitext_customer_support.csv"))
-    api_raw = read_support_activity_api(
-        fallback_path=str(PROJECT_ROOT / "data/sample/support_activity_api/sample.json")
-    )
 
-    cases = [map_ticket_to_supportcase(r) for r in tickets_raw] + \
-            [map_api_to_supportcase(r) for r in api_raw]
+    Phase 12 (FR-ING-05): Uses failure isolation — if one source fails,
+    the others still produce output.
+    """
+    run_result = _ingest_all_sources_isolated()
+
+    cases = []
+    for name, mapper in [("support_tickets", map_ticket_to_supportcase), ("support_activity_api", map_api_to_supportcase)]:
+        raw = run_result.get_records(name)
+        cases.extend(mapper(r) for r in raw)
+
+    kb_raw = run_result.get_records("kb_articles")
     articles = [map_kb_to_knowledgearticle(r, i) for i, r in enumerate(kb_raw)]
     joined = join_cases_to_articles(cases, articles, TICKET_TYPE_TO_KB_CATEGORY)
     output_records, errors = build_output_records(joined)
@@ -122,8 +133,38 @@ def _run_pipeline_for_scheduler() -> tuple[list[JoinedCaseOutput], list[tuple]]:
     # Cache the result so validate_pipeline/deploy can use it after a build
     _cache["output_records"] = output_records
     _cache["errors"] = errors
+    _cache["ingestion_result"] = run_result
 
     return output_records, errors
+
+
+def _ingest_all_sources_isolated() -> IngestionRunResult:
+    """
+    Ingest all 3 sources with failure isolation (FR-ING-05).
+    A failure in one source does not block the others.
+    Returns an IngestionRunResult with per-source results.
+    """
+    sources = [
+        (
+            "support_tickets",
+            read_support_tickets,
+            (str(PROJECT_ROOT / "data/raw/support_tickets/customer_support_tickets.csv"),),
+            {},
+        ),
+        (
+            "kb_articles",
+            read_kb_articles,
+            (str(PROJECT_ROOT / "data/raw/kb_articles/bitext_customer_support.csv"),),
+            {},
+        ),
+        (
+            "support_activity_api",
+            read_support_activity_api,
+            (),
+            {"fallback_path": str(PROJECT_ROOT / "data/sample/support_activity_api/sample.json")},
+        ),
+    ]
+    return run_ingestion_isolated(sources)
 
 
 @mcp.tool()
@@ -154,27 +195,33 @@ def get_schema(model_name: str) -> dict:
 def run_pipeline() -> dict:
     """Runs ingestion, normalization, and join across all 3 sources.
     Caches the result for validate_pipeline/preview_output/deploy to use.
-    Returns summary counts only — call preview_output to see actual records."""
-    tickets_raw = read_support_tickets(str(PROJECT_ROOT / "data/raw/support_tickets/customer_support_tickets.csv"))
-    kb_raw = read_kb_articles(str(PROJECT_ROOT / "data/raw/kb_articles/bitext_customer_support.csv"))
-    api_raw = read_support_activity_api(
-        fallback_path=str(PROJECT_ROOT / "data/sample/support_activity_api/sample.json")
-    )
+    Returns summary counts only — call preview_output to see actual records.
 
-    cases = [map_ticket_to_supportcase(r) for r in tickets_raw] + \
-            [map_api_to_supportcase(r) for r in api_raw]
+    Phase 12 (FR-ING-05): Ingestion failure isolation — if one source fails,
+    the others still produce output. The returned dict includes per-source
+    ingestion status."""
+    run_result = _ingest_all_sources_isolated()
+
+    cases = []
+    for name, mapper in [("support_tickets", map_ticket_to_supportcase), ("support_activity_api", map_api_to_supportcase)]:
+        raw = run_result.get_records(name)
+        cases.extend(mapper(r) for r in raw)
+
+    kb_raw = run_result.get_records("kb_articles")
     articles = [map_kb_to_knowledgearticle(r, i) for i, r in enumerate(kb_raw)]
     joined = join_cases_to_articles(cases, articles, TICKET_TYPE_TO_KB_CATEGORY)
     output_records, errors = build_output_records(joined)
 
     _cache["output_records"] = output_records
     _cache["errors"] = errors
+    _cache["ingestion_result"] = run_result
 
     return {
         "cases_ingested": len(cases),
         "articles_ingested": len(articles),
         "output_records_built": len(output_records),
         "validation_errors": len(errors),
+        "ingestion": run_result.summary(),
     }
 
 
@@ -987,6 +1034,120 @@ def security_filter_output(schema_name: str = "JoinedCaseOutput", role: str = "v
 def security_get_column_security_summary() -> dict:
     """Returns a summary of column-level security state (FR-SEC-02)."""
     return _column_security.summary()
+
+
+# ---------------------------------------------------------------------------
+# Phase 12: Ingestion, Normalization & Union upgrades (FSD 4.1, 4.3, 4.4)
+# FR-ING-03 (CDC), FR-ING-05 (failure isolation),
+# FR-NORM-02/04 (transform chains + preview),
+# FR-UNION-01/03 (schema-matched union + duplicate detection).
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def ingestion_get_cdc_summary() -> dict:
+    """Returns the CDC high-water mark state for all sources (FR-ING-03).
+    Shows the last-seen index/timestamp/id per source and cumulative totals."""
+    return _cdc_tracker.summary()
+
+
+@mcp.tool()
+def ingestion_reset_cdc(source_name: str = "") -> dict:
+    """Resets the CDC high-water mark for one source (or all if empty).
+    The next run will do a full load for the reset source(s) (FR-ING-03)."""
+    _cdc_tracker.reset(source_name if source_name else None)
+    return {"reset": source_name if source_name else "all"}
+
+
+@mcp.tool()
+def ingestion_get_failure_summary() -> dict:
+    """Returns the per-source ingestion status from the last run_pipeline() call.
+    Shows which sources succeeded and which failed, with error details (FR-ING-05).
+    Must be called after run_pipeline()."""
+    run_result = _cache.get("ingestion_result")
+    if run_result is None:
+        raise RuntimeError("No pipeline run cached — call run_pipeline() first.")
+    return run_result.summary()
+
+
+@mcp.tool()
+def normalization_preview_transform_chain(
+    steps_json: str,
+    sample_records_json: str,
+) -> dict:
+    """
+    Previews a transform chain at each individual step (FR-NORM-02, FR-NORM-04).
+
+    Given a JSON array of TransformStep dicts and a JSON array of sample records,
+    returns the output after EACH step — not just the final result. This lets
+    a user inspect intermediate output without running the full pipeline.
+
+    steps_json: JSON array of {"name": ..., "transform": ..., "field": ..., "params": {...}}
+    sample_records_json: JSON array of record dicts to apply the chain to.
+    """
+    import json
+    from normalization.transform_chain import TransformChain, TransformStep
+
+    step_dicts = json.loads(steps_json)
+    steps = [TransformStep(**s) for s in step_dicts]
+    chain = TransformChain(name="preview_chain", steps=steps)
+
+    records = json.loads(sample_records_json)
+    previews = chain.preview_all_steps(records)
+
+    return {
+        "chain_summary": chain.summary(),
+        "previews": [
+            {
+                "step_index": p["step_index"],
+                "step_name": p["step_name"],
+                "transform": p["transform"],
+                "field": p["field"],
+                "record_count": p["record_count"],
+                "records": p["records"][:5],  # limit to 5 for readability
+            }
+            for p in previews
+        ],
+    }
+
+
+@mcp.tool()
+def union_check_schemas(schema_names: list[str]) -> dict:
+    """
+    Pre-execution check: verify that multiple sources share the same canonical
+    schema before unioning (FR-UNION-01). Raises if schemas don't match.
+
+    schema_names: list of schema names to check (e.g., ["SupportCase", "SupportCase"]).
+    """
+    from transform.union import check_schemas_match, SchemaMismatchError
+    try:
+        check_schemas_match(schema_names)
+        return {"schemas_match": True, "schema_names": schema_names}
+    except SchemaMismatchError as e:
+        return {"schemas_match": False, "error": str(e), "schema_names": schema_names}
+
+
+@mcp.tool()
+def union_detect_duplicates(records_json: str, source_field: str = "source_system") -> dict:
+    """
+    Detects exact-duplicate rows across unioned sources (FR-UNION-03).
+    Returns the duplicate flags — does NOT remove the duplicates.
+
+    records_json: JSON array of record dicts to check.
+    source_field: the field name that identifies the source (excluded from comparison).
+    """
+    import json
+    from transform.union import detect_duplicates
+
+    records = json.loads(records_json)
+    flags = detect_duplicates(records, source_field=source_field)
+    return {
+        "total_records": len(records),
+        "duplicate_count": len(flags),
+        "duplicates": [
+            {"record_index": f.record_index, "sources": f.sources}
+            for f in flags
+        ],
+    }
 
 
 if __name__ == "__main__":

@@ -253,13 +253,20 @@ class IRExecutor:
                 elif agg.fn == "max":
                     result[agg.as_] = max(values) if values else None
                 else:
-                    raise ValueError(f"Unsupported aggregation function: {agg.fn}")
+                                        raise ValueError(f"Unsupported aggregation function: {agg.fn}")
             results.append(result)
 
         return results
 
     def _exec_union(self, step: UnionOperator, datasets: dict) -> list[Any]:
-        """Combine multiple datasets into one."""
+        """Combine multiple datasets into one.
+
+        Phase 12 (FR-UNION-01): Pre-execution schema check is available
+        via transform.union.check_schemas_match(), but the executor itself
+        remains a simple concatenation - the schema check is enforced at
+        the union_with_checks() API level and in the MCP tools, not here,
+        to keep the executor backward-compatible with existing IRs.
+        """
         combined = []
         for input_name in step.inputs:
             combined.extend(datasets.get(input_name, []))

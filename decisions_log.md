@@ -245,43 +245,82 @@ git add . && git commit -m "Phase 8 complete: versioning/branch/diff/proposal/ro
   the tool success message.
 
   
-## FSD-Extension Phase 10 - Monitoring & Alerting (FSD 4.15)
-- FR-MON-01 (run health dashboard): RunHealthDashboard reads
-  BuildScheduler's BuildResult history (Phase 9) and the deploy audit log
-  (deploy_audit_log.txt). Exposes per-run summaries (status, duration,
-  record_count) and per-pipeline trends (success rate, avg duration,
-  avg record count, row-count history). Does not duplicate run-tracking
-  logic - it reads what the scheduler already records.
-- FR-MON-02 (data-quality metrics): DataQualityAnalyzer computes null-rate,
-  schema-drift, and duplicate-rate from ACTUAL output records (cached
-  pipeline output or files under data/processed/). Schema-drift is computed
-  against the Schema Registry (Phase 1) - drift has a real, versioned
-  baseline, not an arbitrary snapshot. Three drift types detected:
-  missing_field (in schema but absent from output), extra_field (in output
-  but not in schema), type_mismatch (inferred type doesn't match registered
-  canonical type).
-- FR-MON-03 (SLA/failure alerting - priority requirement): AlertEngine
-  detects run failures (any non-success status -> critical alert) and SLA
-  breaches (duration exceeds configured threshold -> warning alert).
-  Generates real AlertRecord objects with all required fields (alert_id,
-  type, severity, pipeline_name, run_id, owner, reason, timestamp,
-  run_started_at, run_duration_seconds, run_status, details).
-  Notification channel is a STUB (StubNotificationChannel) - stores alerts
-  in memory and optionally writes to JSON file. No email/Slack integration.
-  This is clearly labeled as a stub per the FSD MVP scope. The alert
-  DETECTION and RECORD GENERATION logic is real and fully testable.
-- deploy_gate.py NOT TOUCHED - confirmed via git diff (only the .pyc cache
-  changed from running tests). The monitoring layer is observational only:
-  it reads from BuildScheduler history and output files, does not modify
-  pipeline state, does not run builds, does not deploy.
-- 9 new MCP tools added to server.py: monitoring_get_run_health,
-  monitoring_get_run_history, monitoring_get_pipeline_trend,
-  monitoring_get_deploy_history, monitoring_get_dq_metrics,
-  monitoring_get_dq_metrics_from_file, monitoring_add_sla,
-  monitoring_evaluate_alerts, monitoring_list_alerts,
-  monitoring_get_alert_summary.
-- Verified: 31/31 Phase 10 tests pass, 27/27 Phase 9 tests pass,
-  6/6 pipeline tests pass (64 total). All tests assert on actual
-  behavior/state, not docstrings or log messages.
+## FSD-Extension Phase 10 — Monitoring & Alerting
+- FR-MON-01: run health dashboard reads from BuildScheduler's BuildResult
+  history (Phase 9) and deploy_audit_log.txt — no parallel run-tracking
+  system invented. Exposes status, duration, row-count trends.
+- FR-MON-02: data-quality metrics (null-rate, duplicate-rate, schema-drift)
+  computed from real output records. Schema-drift compares against the
+  actual Schema Registry (Phase 1) as baseline — three drift types
+  detected: missing_field, extra_field, type_mismatch.
+- FR-MON-03 (priority requirement this phase): AlertEngine generates real
+  AlertRecord objects (owner, reason, timestamp, severity) for SLA breaches
+  and run/build failures. Notification channel is an explicitly-labeled
+  stub (in-memory/file) — no fake email/Slack integration, per FSD MVP
+  scope. 15 tests cover this requirement specifically, including
+  no-false-positive cases and idempotency.
+- Confirmed observational-only: monitoring imports only from
+  deployment.scheduler and schema.registry_setup — no import of
+  deploy_gate.py, no deploy/build-trigger methods. deploy_gate.py diff
+  confirmed genuinely empty (not just "only cache files").
+- Verified: 64/64 real pytest output (31 new + 27 Phase 9 + 6 original,
+  no regressions), all files parse clean, both artifact greps empty.
 
-git add . && git commit -m "Phase 10 complete: monitoring/alerting (FR-MON-01/02/03), deploy_gate untouched, 64 tests pass" && git push
+
+## FSD-Extension Phase 11 — Security & Access Control
+- FR-SEC-01: RBACManager with 5 roles (viewer, editor, approver, deployer,
+  admin), each an explicit permission set — deployer does NOT imply
+  approve, approver does NOT imply deploy (confirmed by dedicated tests).
+  require_permission decorator wraps MCP tools including deploy,
+  versioning_update_branch_ir, versioning_create/review/merge_proposal,
+  versioning_rollback.
+- FR-SEC-02: column-level security ties into the Schema Registry via a new
+  `sensitive: bool` flag on FieldDefinition (additive) — ColumnSecurityManager
+  filters sensitive fields by role, default visible only to approver/admin.
+- FR-SEC-03: unified AuditLogger (JSONL) wraps/fills gaps in existing
+  Phase 6/8/9 logs rather than duplicating them — logs actor for edits,
+  approvals, deploys, access-denials, role assignments.
+- Two-layer independence explicitly proven: RBAC sits in front of
+  deploy_gate.py as a stricter, additive precondition — a viewer is blocked
+  by AccessDeniedError before ever reaching deploy_gate.py, and separately
+  a deployer with approved=False is still blocked by deploy_gate.py's own
+  RuntimeError. Both directions tested; deploy_gate.py's diff confirmed
+  genuinely empty, verified directly, not just claimed.
+- Verified: 132/132 real pytest output (68 new + 64 prior, zero
+  regressions), all files parse clean, both artifact greps empty.
+
+
+## FSD-Extension Phase 12 — Ingestion & Normalization Enhancements (FINAL PHASE)
+- FR-ING-03: HighWaterMarkTracker enables incremental/CDC-style ingestion
+  via persisted marks + filter helpers.
+- FR-ING-05 (priority gap, now fixed): ingestion failures are isolated
+  per-source via ingest_with_isolation()/run_ingestion_isolated() —
+  one source failing (e.g. API connection refused) no longer crashes the
+  whole run; other sources' data still flows through, with per-source
+  success/failure recorded.
+- FR-NORM-02/04: TransformChain compiles to existing IR MapOperators (no
+  parallel transform system) with per-step preview via preview_at_step().
+- FR-UNION-01/03: check_schemas_match() raises before execution on schema
+  mismatch; detect_duplicates() flags exact-duplicate rows across unioned
+  sources without silently removing them.
+- Verified: 161/161 tests, deploy_gate.py diff empty (touched exactly once
+  across all 12 phases — Phase 9's additive parameters — never weakened),
+  full-codebase artifact scan clean.
+
+## PROJECT STATUS: 12-phase FSD extension complete
+Went from a 3-phase manual MVP (proven with a real agent via MCP) to full
+FSD coverage, phase by phase, each independently verified rather than
+trusted on the implementing agent's self-report — catching and fixing
+real bugs along the way (Phase 3 scratchpad contamination + missing
+import, Phase 5 stalled-session corruption + test crash, Phase 7 silent
+relationship-resolution bug, Phase 9 scratchpad contamination in
+deploy_gate.py itself). The one constant throughout: deploy_gate.py's
+core is_safe-AND-approved gate, with no bypass, verified unchanged at
+every single phase.
+
+Known remaining gaps (honest, not exhaustive): stub notification channel
+(no real email/Slack), non-git-backed branching, Python-only execution
+engine (no Spark/Flink), no RDBMS/Kafka connectors, no secrets manager,
+heuristic (not ML-trained) agent confidence scoring, no streaming
+ingestion, no round-trip IR editing. All were either explicitly
+out-of-scope per the FSD or reasonable MVP-level simplifications.
