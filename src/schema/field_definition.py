@@ -5,14 +5,16 @@ A FieldDefinition is one named field in a schema (e.g., "created_at") that:
 - References a canonical type from the registry (e.g., "Timestamp")
 - Declares whether it's nullable (Optional) or required
 - Declares whether it's required in the final output contract
+- Declares whether it's sensitive (Phase 11, FR-SEC-02 — column-level security)
 
 This lets us build schemas that are registry-aware, rather than hardcoding
 Python types directly in Pydantic models.
 
-FSD requirements: FR-REG-01 (canonical type catalog), FR-VAL-01 (required-column tracking)
+FSD requirements: FR-REG-01 (canonical type catalog), FR-VAL-01 (required-column tracking),
+                   FR-SEC-02 (column-level security)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 from .type_registry import TypeRegistry
 
@@ -35,6 +37,7 @@ class FieldDefinition:
     nullable: bool = True
     required_in_output: bool = False
     description: str = ""
+    sensitive: bool = False  # FR-SEC-02: mark sensitive columns (e.g. tax IDs) for role-based filtering
 
     def validate(self, value: Any, registry: TypeRegistry) -> tuple[bool, Optional[str]]:
         """
@@ -59,4 +62,5 @@ class FieldDefinition:
             "nullable": self.nullable,
             "required_in_output": self.required_in_output,
             "description": self.description,
+            "sensitive": self.sensitive,
         }

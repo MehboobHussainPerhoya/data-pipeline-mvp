@@ -31,6 +31,9 @@ from deployment.scheduler import BuildScheduler
 from monitoring.run_health import RunHealthDashboard
 from monitoring.data_quality import DataQualityAnalyzer
 from monitoring.alerting import AlertEngine, SLAConfig, StubNotificationChannel
+from security.rbac import Role, Permission, RBACManager, AccessDeniedError
+from security.column_security import ColumnSecurityManager
+from security.audit_log import AuditLogger
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -42,6 +45,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 if FastMCP is not None:
     mcp = FastMCP("data-pipeline-mvp")
+else:
+    # Fallback: no-op decorator so the module can still be imported
+    # (e.g., in test environments without the mcp package).
+    class _NoOpMCP:
+        def tool(self):
+            def decorator(func):
+                return func
+            return decorator
+        def run(self):
+            pass
+    mcp = _NoOpMCP()
 
 # In-memory cache — holds the result of the last run_pipeline call, so
 # later tool calls (validate, preview, deploy) can build on it without
@@ -73,6 +87,17 @@ _version_history.snapshot_initial()  # capture the starting Main as version 1
 # approval.
 # ---------------------------------------------------------------------------
 _build_scheduler = BuildScheduler()
+
+# ---------------------------------------------------------------------------
+# Phase 11: Security & Access Control (FSD 4.16)
+# RBAC (FR-SEC-01), column-level security (FR-SEC-02), audit logging (FR-SEC-03).
+# The RBAC manager sits in FRONT of existing tools and restricts access by role.
+# It is a stricter, additive precondition — it NEVER weakens or bypasses
+# deploy_gate.py's is_safe/approved checks.
+# ---------------------------------------------------------------------------
+_rbac = RBACManager()
+_column_security = ColumnSecurityManager()
+_audit_logger = AuditLogger(log_path=str(PROJECT_ROOT / "data/processed/security_audit_log.jsonl"))
 
 
 def _run_pipeline_for_scheduler() -> tuple[list[JoinedCaseOutput], list[tuple]]:
@@ -181,23 +206,64 @@ def deploy(approved: bool, deployed_by: str = "", version_ref: str = "") -> dict
     to have passed AND approved=True to be explicitly set by the caller.
     There is no bypass: missing either condition blocks the deploy.
 
-    deployed_by: identity of the person approving the deploy (for audit log).
+    Phase 11 (FR-SEC-01): RBAC permission check runs FIRST, before any
+    cache check or deploy_gate.py call. A viewer is blocked here before
+    ever reaching deploy_gate.py's is_safe/approved gates. This is a
+    stricter, additive precondition — it does NOT replace or weaken
+    deploy_gate.py's own checks.
+
+    deployed_by: identity of the person approving the deploy (for audit log
+                 and RBAC permission check — this is the actor).
     version_ref: the version of the pipeline being deployed (for audit log).
     Both are optional metadata — they do not affect the gating condition."""
+    # --- Phase 11: RBAC check (FR-SEC-01) ---
+    # This runs BEFORE the cache checks and BEFORE deploy_gate.py.
+    # A viewer or unassigned actor is blocked here — deploy_gate.py is
+    # never reached. This is additive: it makes access stricter, never weaker.
+    _rbac.check_permission(deployed_by, Permission.DEPLOY, action="deploy")
+
     if "output_records" not in _cache:
         raise RuntimeError("No pipeline result cached — call run_pipeline() first.")
     if "is_safe" not in _cache:
         raise RuntimeError("Pipeline not validated — call validate_pipeline() first.")
 
     output_path = str(PROJECT_ROOT / "data/processed/support_cases_output.json")
-    deploy_pipeline(
-        _cache["output_records"],
-        _cache["is_safe"],
-        _cache["safety_reasons"],
-        approved=approved,
-        output_path=output_path,
-        version_ref=version_ref if version_ref else None,
-        deployed_by=deployed_by if deployed_by else None,
+
+    # --- Phase 11: Audit logging (FR-SEC-03) ---
+    # Log the deploy attempt with actor/role context. The existing deploy_gate.py
+    # audit log (deploy_audit_log.txt) continues to record the deploy itself;
+    # this adds the unified security audit view with role + success/failure.
+    actor_role = _rbac.get_role(deployed_by)
+    actor_role_str = actor_role.value if actor_role else "unknown"
+
+    try:
+        deploy_pipeline(
+            _cache["output_records"],
+            _cache["is_safe"],
+            _cache["safety_reasons"],
+            approved=approved,
+            output_path=output_path,
+            version_ref=version_ref if version_ref else None,
+            deployed_by=deployed_by if deployed_by else None,
+        )
+    except RuntimeError as e:
+        # deploy_gate.py blocked the deploy — log the failure and re-raise
+        _audit_logger.log_deploy(
+            actor=deployed_by,
+            role=actor_role_str,
+            resource=output_path,
+            change_detail={"record_count": len(_cache["output_records"]), "approved": approved},
+            success=False,
+            denial_reason=str(e),
+        )
+        raise
+
+    _audit_logger.log_deploy(
+        actor=deployed_by,
+        role=actor_role_str,
+        resource=output_path,
+        change_detail={"record_count": len(_cache["output_records"]), "version_ref": version_ref},
+        success=True,
     )
     return {"status": "deployed", "records": len(_cache["output_records"]), "path": output_path}
 
@@ -415,13 +481,28 @@ def versioning_get_branch_ir(branch_name: str) -> dict:
 
 
 @mcp.tool()
-def versioning_update_branch_ir(branch_name: str, ir_json: str) -> dict:
+def versioning_update_branch_ir(branch_name: str, ir_json: str, actor: str = "") -> dict:
     """Replaces a branch's PipelineIR with a new version provided as JSON (FR-VER-01).
     This is how edits to a branch are saved. The branch must exist and not be merged.
-    ir_json: a JSON string representing the new PipelineIR."""
+
+    Phase 11 (FR-SEC-01): Requires EDIT permission. The actor is logged
+    (FR-SEC-03) — this fills the gap where pipeline edits previously had
+    no actor recorded.
+
+    ir_json: a JSON string representing the new PipelineIR.
+    actor: identity of the person making the edit (for RBAC + audit)."""
+    _rbac.check_permission(actor, Permission.EDIT, action="update_branch_ir")
     from ir.pipeline_ir import PipelineIR
     new_ir = PipelineIR.model_validate_json(ir_json)
     branch = _branch_store.update_branch(name=branch_name, ir=new_ir)
+
+    actor_role = _rbac.get_role(actor)
+    _audit_logger.log_edit(
+        actor=actor,
+        role=actor_role.value if actor_role else "unknown",
+        resource=f"branch:{branch_name}",
+        change_detail={"step_count": branch.ir.step_count()},
+    )
     return branch.summary()
 
 
@@ -441,8 +522,13 @@ def versioning_create_proposal(proposer: str, branch_name: str) -> dict:
     """Creates a proposal to merge a branch into Main (FR-VER-03).
     The diff is computed and frozen at proposal time so the reviewer sees
     exactly what was proposed. The proposal starts in 'open' status.
-    proposer: identity of who is proposing the merge.
+
+    Phase 11 (FR-SEC-01): Requires EDIT permission (proposing a merge is an
+    edit-level action — you're proposing to change Main's logic).
+
+    proposer: identity of who is proposing the merge (also the RBAC actor).
     branch_name: the branch to merge."""
+    _rbac.check_permission(proposer, Permission.EDIT, action="create_proposal")
     proposal = _proposal_store.create_proposal(proposer=proposer, branch_name=branch_name)
     return proposal.summary()
 
@@ -462,28 +548,48 @@ def versioning_list_proposals(status: str = None) -> list[dict]:
 def versioning_review_proposal(proposal_id: int, reviewer: str, action: str, reason: str = "") -> dict:
     """Reviews a proposal — approves or rejects it (FR-VER-03).
     Enforces second-party review: reviewer MUST differ from the proposer.
+
+    Phase 11 (FR-SEC-01): Requires APPROVE permission. The review is logged
+    with actor/role context (FR-SEC-03).
+
     proposal_id: the proposal to review.
     reviewer: identity of the reviewer (must be different from the proposer).
     action: 'approve' or 'reject'.
     reason: optional reason (required if rejecting)."""
+    _rbac.check_permission(reviewer, Permission.APPROVE, action="review_proposal")
     proposal = _proposal_store.review_proposal(
         proposal_id=proposal_id,
         reviewer=reviewer,
         action=action,
         reason=reason,
     )
+
+    reviewer_role = _rbac.get_role(reviewer)
+    _audit_logger.log_approve(
+        actor=reviewer,
+        role=reviewer_role.value if reviewer_role else "unknown",
+        resource=f"proposal:{proposal_id}",
+        change_detail={"action": action, "branch": proposal.branch_name},
+        success=(action == "approve"),
+    )
     return proposal.summary()
 
 
 @mcp.tool()
-def versioning_merge_proposal(proposal_id: int) -> dict:
+def versioning_merge_proposal(proposal_id: int, actor: str = "") -> dict:
     """Merges an approved proposal's branch into Main (FR-VER-03).
     The proposal must have been approved by a reviewer distinct from the proposer.
+
+    Phase 11 (FR-SEC-01): Requires APPROVE permission (merging is completing
+    the approval workflow).
 
     IMPORTANT: This is a PIPELINE LOGIC change only — it does NOT deploy output.
     After merging, the user must still run_pipeline() and deploy() through
     deploy_gate.py (is_safe=True AND approved=True) to produce and deploy output.
-    Merge and deploy are distinct actions by design."""
+    Merge and deploy are distinct actions by design.
+
+    actor: identity of the person merging (for RBAC + audit)."""
+    _rbac.check_permission(actor, Permission.APPROVE, action="merge_proposal")
     proposal = _proposal_store.get_proposal(proposal_id)
     branch_name = proposal.branch_name
 
@@ -509,13 +615,28 @@ def versioning_list_versions() -> list[dict]:
 
 
 @mcp.tool()
-def versioning_rollback(version: int) -> dict:
+def versioning_rollback(version: int, actor: str = "") -> dict:
     """Reverts Main to a previously deployed version (FR-VER-04).
     This is a PIPELINE LOGIC change only — it does NOT deploy output.
     After rollback, the user must still run_pipeline() and deploy() to
     produce output from the reverted logic.
-    version: the version number to revert to (see versioning_list_versions)."""
+
+    Phase 11 (FR-SEC-01): Requires DEPLOY permission (rollback is a
+    production-impacting action, same permission level as deploy).
+
+    version: the version number to revert to (see versioning_list_versions).
+    actor: identity of the person rolling back (for RBAC + audit)."""
+    _rbac.check_permission(actor, Permission.DEPLOY, action="rollback")
     snapshot = _version_history.rollback_to(version=version)
+
+    actor_role = _rbac.get_role(actor)
+    _audit_logger.log_deploy(
+        actor=actor,
+        role=actor_role.value if actor_role else "unknown",
+        resource=f"rollback_to_version:{version}",
+        change_detail={"version": version},
+        success=True,
+    )
     return snapshot.summary()
 
 
@@ -763,6 +884,109 @@ def monitoring_get_alert_summary() -> dict:
     """Returns a summary of the alert engine state (FR-MON-03).
     Includes total alerts, breakdown by type and severity, and SLA configs."""
     return _alert_engine.summary()
+
+
+# ---------------------------------------------------------------------------
+# Phase 11: Security & Access Control MCP tools (FSD 4.16)
+# FR-SEC-01 (RBAC), FR-SEC-02 (column-level security), FR-SEC-03 (audit logging).
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def security_assign_role(actor: str, role: str, assigned_by: str = "admin") -> dict:
+    """Assigns a role to an actor (FR-SEC-01).
+    Requires MANAGE_USERS permission (admin only).
+
+    actor: the actor to assign the role to.
+    role: one of 'viewer', 'editor', 'approver', 'deployer', 'admin'.
+    assigned_by: the admin performing the assignment (for audit)."""
+    _rbac.check_permission(assigned_by, Permission.MANAGE_USERS, action="assign_role")
+    role_enum = Role(role)
+    _rbac.assign_role(actor, role_enum)
+
+    assigner_role = _rbac.get_role(assigned_by)
+    _audit_logger.log_role_assignment(
+        actor=assigned_by,
+        role=assigner_role.value if assigner_role else "unknown",
+        target_actor=actor,
+        target_role=role_enum.value,
+    )
+    return {"actor": actor, "role": role_enum.value}
+
+
+@mcp.tool()
+def security_get_rbac_summary() -> dict:
+    """Returns the RBAC state — all role assignments and the role-permission
+    mapping (FR-SEC-01)."""
+    return _rbac.summary()
+
+
+@mcp.tool()
+def security_get_audit_log(action: str = "") -> dict:
+    """Returns the security audit log — all recorded events with actor, role,
+    action, timestamp, and change detail (FR-SEC-03).
+    action: optional filter (e.g., 'deploy', 'edit', 'approve', 'access_denied')."""
+    if action:
+        events = _audit_logger.get_events_by_action(action)
+    else:
+        events = _audit_logger.get_events()
+    return {
+        "events": [e.to_dict() for e in events],
+        "summary": _audit_logger.summary(),
+    }
+
+
+@mcp.tool()
+def security_mark_field_sensitive(schema_name: str, field_name: str, actor: str = "") -> dict:
+    """Marks a field as sensitive for column-level security (FR-SEC-02).
+    Sensitive fields are filtered out for roles without sensitive visibility.
+    Requires MANAGE_USERS permission (admin only).
+
+    schema_name: the schema containing the field.
+    field_name: the field to mark sensitive.
+    actor: the admin performing the marking (for RBAC + audit)."""
+    _rbac.check_permission(actor, Permission.MANAGE_USERS, action="mark_sensitive")
+    _column_security.mark_field_sensitive(schema_name, field_name)
+    return {"schema": schema_name, "field": field_name, "sensitive": True}
+
+
+@mcp.tool()
+def security_unmark_field_sensitive(schema_name: str, field_name: str, actor: str = "") -> dict:
+    """Removes the sensitive marking from a field (FR-SEC-02).
+    Requires MANAGE_USERS permission (admin only)."""
+    _rbac.check_permission(actor, Permission.MANAGE_USERS, action="unmark_sensitive")
+    _column_security.unmark_field_sensitive(schema_name, field_name)
+    return {"schema": schema_name, "field": field_name, "sensitive": False}
+
+
+@mcp.tool()
+def security_get_field_visibility(schema_name: str, role: str) -> dict:
+    """Returns which fields are visible for a given role (FR-SEC-02).
+    schema_name: the schema to check.
+    role: the role to check visibility for."""
+    role_enum = Role(role)
+    visibility = _column_security.get_field_visibility(schema_name, role_enum)
+    return {"schema": schema_name, "role": role, "visibility": visibility}
+
+
+@mcp.tool()
+def security_filter_output(schema_name: str = "JoinedCaseOutput", role: str = "viewer", limit: int = 10) -> list[dict]:
+    """Returns pipeline output records with sensitive columns filtered out
+    for the given role (FR-SEC-02). Must be called after run_pipeline().
+
+    schema_name: the schema to use for sensitive-field lookup.
+    role: the role to filter for.
+    limit: max records to return."""
+    if "output_records" not in _cache:
+        raise RuntimeError("No pipeline result cached — call run_pipeline() first.")
+    role_enum = Role(role)
+    records = [r.model_dump() for r in _cache["output_records"][:limit]]
+    return _column_security.filter_records(records, schema_name, role_enum)
+
+
+@mcp.tool()
+def security_get_column_security_summary() -> dict:
+    """Returns a summary of column-level security state (FR-SEC-02)."""
+    return _column_security.summary()
 
 
 if __name__ == "__main__":
