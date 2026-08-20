@@ -28,6 +28,9 @@ from versioning.diff import diff_pipeline_irs
 from versioning.proposal import ProposalStore, ProposalStatus
 from versioning.rollback import VersionHistory
 from deployment.scheduler import BuildScheduler
+from monitoring.run_health import RunHealthDashboard
+from monitoring.data_quality import DataQualityAnalyzer
+from monitoring.alerting import AlertEngine, SLAConfig, StubNotificationChannel
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -643,6 +646,123 @@ def scheduler_summary() -> dict:
     """Returns a summary of the scheduler state — schedules, triggers, and
     total builds run (FR-DEPLOY-02)."""
     return _build_scheduler.summary()
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: Monitoring & Alerting MCP tools (FSD 4.15)
+# FR-MON-01 (run health), FR-MON-02 (data-quality metrics), FR-MON-03 (alerting).
+# These tools are OBSERVATIONAL ONLY — they read and report on what already
+# happened. They do not run builds, deploy, or modify pipeline state.
+# ---------------------------------------------------------------------------
+
+_run_health_dashboard = RunHealthDashboard(_build_scheduler)
+_dq_analyzer = DataQualityAnalyzer()
+_alert_engine = AlertEngine()
+
+
+@mcp.tool()
+def monitoring_get_run_health() -> dict:
+    """Returns run health summaries and trends for all pipelines (FR-MON-01).
+    Reads from the BuildScheduler's BuildResult history — status, duration,
+    and row-count trends per pipeline. Does not run any builds."""
+    return _run_health_dashboard.summary()
+
+
+@mcp.tool()
+def monitoring_get_run_history() -> list[dict]:
+    """Returns a chronological list of all run summaries (FR-MON-01).
+    Each entry includes run_id, pipeline_name, status, duration, and record_count.
+    Reads from the scheduler's BuildResult history."""
+    return [s.to_dict() for s in _run_health_dashboard.get_all_runs()]
+
+
+@mcp.tool()
+def monitoring_get_pipeline_trend(pipeline_name: str) -> dict:
+    """Returns the run trend for a specific pipeline (FR-MON-01).
+    Includes success rate, average duration, average record count, and
+    row-count/duration history.
+    pipeline_name: the schedule/trigger name to get trends for."""
+    trend = _run_health_dashboard.get_trend(pipeline_name)
+    if trend is None:
+        raise RuntimeError(f"No runs found for pipeline '{pipeline_name}'.")
+    return trend.to_dict()
+
+
+@mcp.tool()
+def monitoring_get_deploy_history() -> list[dict]:
+    """Returns the deploy audit history from deploy_audit_log.txt (FR-MON-01).
+    Each entry includes timestamp, record_count, output_path, and approved status.
+    Reads the existing audit log — does not modify it."""
+    audit_path = str(PROJECT_ROOT / "data/processed/deploy_audit_log.txt")
+    return _run_health_dashboard.get_deploy_history(audit_path)
+
+
+@mcp.tool()
+def monitoring_get_dq_metrics(schema_name: str = "JoinedCaseOutput") -> dict:
+    """Computes data-quality metrics for the cached pipeline output (FR-MON-02).
+    Tracks null-rate, schema-drift, and duplicate-rate against the registered
+    schema. Must be called after run_pipeline().
+    schema_name: the registered schema to use as the drift baseline."""
+    if "output_records" not in _cache:
+        raise RuntimeError("No pipeline result cached — call run_pipeline() first.")
+    metrics = _dq_analyzer.analyze(_cache["output_records"], schema_name=schema_name)
+    return metrics.to_dict()
+
+
+@mcp.tool()
+def monitoring_get_dq_metrics_from_file(file_path: str = "", schema_name: str = "JoinedCaseOutput") -> dict:
+    """Computes data-quality metrics from an output JSON file (FR-MON-02).
+    If file_path is empty, uses the default deployed output path.
+    schema_name: the registered schema to use as the drift baseline."""
+    path = file_path if file_path else str(PROJECT_ROOT / "data/processed/support_cases_output.json")
+    metrics = _dq_analyzer.analyze_from_file(path, schema_name=schema_name)
+    return metrics.to_dict()
+
+
+@mcp.tool()
+def monitoring_add_sla(pipeline_name: str, max_duration_seconds: float, owner: str = "pipeline-owner") -> dict:
+    """Registers an SLA configuration for a pipeline (FR-MON-03).
+    If a build for this pipeline exceeds max_duration_seconds, an SLA breach
+    alert is generated.
+    pipeline_name: the schedule/trigger name.
+    max_duration_seconds: the SLA duration threshold.
+    owner: the designated owner to notify on breach."""
+    config = SLAConfig(
+        pipeline_name=pipeline_name,
+        max_duration_seconds=max_duration_seconds,
+        owner=owner,
+    )
+    _alert_engine.add_sla(config)
+    return config.to_dict()
+
+
+@mcp.tool()
+def monitoring_evaluate_alerts() -> dict:
+    """Evaluates all build results for alert conditions (FR-MON-03).
+    Detects run failures and SLA breaches, generates alert records, and
+    sends them through the notification channel (stub).
+    Returns a summary of newly generated alerts."""
+    new_alerts = _alert_engine.evaluate(_build_scheduler)
+    return {
+        "new_alert_count": len(new_alerts),
+        "new_alerts": [a.to_dict() for a in new_alerts],
+        "engine_summary": _alert_engine.summary(),
+    }
+
+
+@mcp.tool()
+def monitoring_list_alerts() -> list[dict]:
+    """Returns all generated alert records (FR-MON-03).
+    Each alert includes: alert_id, type, severity, pipeline_name, owner,
+    reason, timestamp, and run details."""
+    return [a.to_dict() for a in _alert_engine.get_alerts()]
+
+
+@mcp.tool()
+def monitoring_get_alert_summary() -> dict:
+    """Returns a summary of the alert engine state (FR-MON-03).
+    Includes total alerts, breakdown by type and severity, and SLA configs."""
+    return _alert_engine.summary()
 
 
 if __name__ == "__main__":

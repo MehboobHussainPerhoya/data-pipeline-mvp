@@ -243,3 +243,45 @@ git add . && git commit -m "Phase 8 complete: versioning/branch/diff/proposal/ro
   fixed with a single_find_and_replace before proceeding. This reinforces
   the standing rule: always re-read a file after editing it, never trust
   the tool success message.
+
+  
+## FSD-Extension Phase 10 - Monitoring & Alerting (FSD 4.15)
+- FR-MON-01 (run health dashboard): RunHealthDashboard reads
+  BuildScheduler's BuildResult history (Phase 9) and the deploy audit log
+  (deploy_audit_log.txt). Exposes per-run summaries (status, duration,
+  record_count) and per-pipeline trends (success rate, avg duration,
+  avg record count, row-count history). Does not duplicate run-tracking
+  logic - it reads what the scheduler already records.
+- FR-MON-02 (data-quality metrics): DataQualityAnalyzer computes null-rate,
+  schema-drift, and duplicate-rate from ACTUAL output records (cached
+  pipeline output or files under data/processed/). Schema-drift is computed
+  against the Schema Registry (Phase 1) - drift has a real, versioned
+  baseline, not an arbitrary snapshot. Three drift types detected:
+  missing_field (in schema but absent from output), extra_field (in output
+  but not in schema), type_mismatch (inferred type doesn't match registered
+  canonical type).
+- FR-MON-03 (SLA/failure alerting - priority requirement): AlertEngine
+  detects run failures (any non-success status -> critical alert) and SLA
+  breaches (duration exceeds configured threshold -> warning alert).
+  Generates real AlertRecord objects with all required fields (alert_id,
+  type, severity, pipeline_name, run_id, owner, reason, timestamp,
+  run_started_at, run_duration_seconds, run_status, details).
+  Notification channel is a STUB (StubNotificationChannel) - stores alerts
+  in memory and optionally writes to JSON file. No email/Slack integration.
+  This is clearly labeled as a stub per the FSD MVP scope. The alert
+  DETECTION and RECORD GENERATION logic is real and fully testable.
+- deploy_gate.py NOT TOUCHED - confirmed via git diff (only the .pyc cache
+  changed from running tests). The monitoring layer is observational only:
+  it reads from BuildScheduler history and output files, does not modify
+  pipeline state, does not run builds, does not deploy.
+- 9 new MCP tools added to server.py: monitoring_get_run_health,
+  monitoring_get_run_history, monitoring_get_pipeline_trend,
+  monitoring_get_deploy_history, monitoring_get_dq_metrics,
+  monitoring_get_dq_metrics_from_file, monitoring_add_sla,
+  monitoring_evaluate_alerts, monitoring_list_alerts,
+  monitoring_get_alert_summary.
+- Verified: 31/31 Phase 10 tests pass, 27/27 Phase 9 tests pass,
+  6/6 pipeline tests pass (64 total). All tests assert on actual
+  behavior/state, not docstrings or log messages.
+
+git add . && git commit -m "Phase 10 complete: monitoring/alerting (FR-MON-01/02/03), deploy_gate untouched, 64 tests pass" && git push
